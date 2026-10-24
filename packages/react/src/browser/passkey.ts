@@ -19,8 +19,28 @@ import type { PasskeyAuthOptions, PasskeyRegisterOptions } from "../types.js";
  * of this caveat.
  */
 export class PasskeyUnsupportedError extends Error {
-  constructor() {
-    super("This device/browser can't use a passkey for vault unlock - stick with the password.");
+  constructor(
+    message = "This device/browser can't use a passkey for vault unlock - stick with the password.",
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * WebAuthn is unavailable in an insecure context (any origin that isn't
+ * https:// or http://localhost) - browsers don't even expose
+ * `window.PublicKeyCredential` there, so `@simplewebauthn/browser` falls
+ * back to its own generic "WebAuthn is not supported in this browser"
+ * Error, indistinguishable from a real lack of platform support. Checked
+ * explicitly so the one common, fixable case (serving over plain HTTP to
+ * a non-localhost hostname) gets a message that says so, not a
+ * "try again" that reads like a transient failure.
+ */
+function assertSecureContext(): void {
+  if (typeof window !== "undefined" && !window.isSecureContext) {
+    throw new PasskeyUnsupportedError(
+      "Passkeys need a secure connection (https://, or http://localhost) - this page is being served over plain HTTP.",
+    );
   }
 }
 
@@ -42,6 +62,8 @@ async function getPasskeyAuthOptions(client: VaultServiceClient): Promise<Passke
  * on this device instead, same as the no-prf-support case.
  */
 export async function registerPasskey(client: VaultServiceClient, label: string): Promise<void> {
+  assertSecureContext();
+
   const { options, prfSalt } = await getPasskeyRegisterOptions(client);
 
   const optionsWithPrf = {
@@ -66,6 +88,8 @@ export async function registerPasskey(client: VaultServiceClient, label: string)
 
 /** Unlocks the vault with a passkey already registered for this user. */
 export async function unlockWithPasskey(client: VaultServiceClient): Promise<void> {
+  assertSecureContext();
+
   const { options, prfSaltByCredentialId } = await getPasskeyAuthOptions(client);
 
   const evalByCredential: Record<string, { first: ArrayBuffer }> = {};
