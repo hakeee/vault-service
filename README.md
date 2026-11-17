@@ -88,9 +88,17 @@ app.post("/notes", async (request, reply) => {
   working. Don't use it for new data. Each scope decides its own format.
   The format is never guessed from the bytes, because a legacy value's
   first byte is random and is `0x01` one time in 256.
-- **Background processes** use `createVaultWorkerClient`. Its routes
-  currently serve the legacy scope only; scoped worker access is next on
-  the roadmap.
+- **Background processes** have two options:
+  - `createVaultWorkerClient`: encrypt/decrypt over HTTP in the legacy
+    scope.
+  - `createRemoteVault({ baseUrl, secret, scopes })`: fetches *named
+    scopes'* keys from `/internal/scope-keys`, caches them briefly, and
+    then gives the process a normal synchronous `VaultHandle`. That's what
+    `@hakeee/module-host` worker processes use. Give each worker a
+    per-scope secret (`createInternalRoutes({ scopeSecrets: { journal:
+    "..." } })`) and it can fetch only those scopes. The DEK and the
+    legacy scope never leave the API process (`legacy` throws on a remote
+    handle).
 
 All of this is about keeping well-behaved features apart. It isn't a
 sandbox: code in the same process could still reach the session cache.

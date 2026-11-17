@@ -69,12 +69,13 @@ the provider, no CSS - a consumer brings its own screens.
 - Format and key-derivation pins in `crypto/scope.test.ts`. If they
   break, stored data would break too.
 
-## Next - scoped worker access
+## v0.2.x - scoped worker access (done)
 
-`createInternalRoutes` / `createVaultWorkerClient` still serve only the
-legacy scope, with one shared secret. Plan: the worker names a scope on
-each call, and the API maps each scope to its own secret, so a worker
-for one feature can't decrypt another's data.
+`/internal/scope-keys` plus `createRemoteVault`: a worker fetches named
+scopes' keys (never the DEK or the legacy scope), optionally limited by a
+secret per scope, and caches them with a TTL. Secrets are compared in
+constant time. Tested over a real socket, round-tripping data with the
+API's own scopes.
 
 Also still open:
 - The vault's own `vault_unlock_method.label` is written in the legacy

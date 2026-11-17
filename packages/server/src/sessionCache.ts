@@ -41,16 +41,21 @@ export function sessionCacheInternals(cache: SessionCache): SessionCacheInternal
   return internals;
 }
 
+/** @internal - a named scope's keys for a cached session, derived once and kept with it. */
+export function scopeKeysOf(session: CachedVaultSession, name: string): ScopeKeys {
+  let keys = session.scopeKeys.get(name);
+  if (!keys) {
+    keys = deriveScopeKeys(session.dek, name);
+    session.scopeKeys.set(name, keys);
+  }
+  return keys;
+}
+
 function toHandle(session: CachedVaultSession): VaultHandle {
   return {
     userId: session.userId,
     scope<Context extends string = string>(name: string) {
-      let keys = session.scopeKeys.get(name);
-      if (!keys) {
-        keys = deriveScopeKeys(session.dek, name);
-        session.scopeKeys.set(name, keys);
-      }
-      return createVaultScope<Context>(name, keys);
+      return createVaultScope<Context>(name, scopeKeysOf(session, name));
     },
     get legacy() {
       session.legacy ??= createLegacyScope(session.dek);
