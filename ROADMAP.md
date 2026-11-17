@@ -19,9 +19,14 @@ Extracted and generalized out of Ebba:
   and a caller can supply their own predicate (Zitadel-shaped or
   otherwise) against the raw ID-token claims.
 - `packages/server/src/schema.ts` - the `user` / `user_identity` /
-  `vault_unlock_method` Drizzle tables, unchanged in shape. This package
-  owns the schema, not the migrations - import it into your own app's
-  schema module and migrate as one database.
+  `vault_unlock_method` Drizzle tables, unchanged in shape.
+- `packages/server/migrations` + `migrateVaultService(db)` - this
+  package also owns those tables' migrations, tracked in their own
+  `__vault_service_migrations` table so consumers can upgrade the library
+  without regenerating anything. The idempotent baseline adopts databases
+  that created the tables themselves (Ebba). `src/migrate.test.ts` guards
+  against `schema.ts` drifting from the migrations. Rules for future
+  migrations are in README "Database".
 - `packages/server/src/sessionCache.ts` - the in-memory
   `Map<sessionId, {dek, indexKey, expiresAt}>`, parameterized by idle
   timeout instead of reading an env var directly.
@@ -48,6 +53,35 @@ Extracted and generalized out of Ebba:
 `useVaultGate` (the pending/offline/login-required/vault-locked/unlocked
 state machine), and browser WebAuthn/recovery-key helpers. No JSX beyond
 the provider, no CSS - a consumer brings its own screens.
+
+## v0.2.0 - scoped encryption (done)
+
+- Versioned envelope format (`crypto/envelope.ts`), with the version
+  byte and a caller context authenticated as GCM associated data.
+- Per-scope keys (`crypto/scope.ts`), with typed contexts.
+- The session cache hands out a `VaultHandle` (`userId`, `scope()`,
+  `legacy`) instead of `{ dek, indexKey }`. Raw access is private to this
+  package's own routes. **Breaking:** `getSession` / `VaultSession` are
+  gone; use `getVault` / `isUnlocked`.
+- `createRequireVault`: a per-request gate, so apps don't hand-roll it.
+- `DEFAULT_BLIND_INDEX_INFO` renamed `LEGACY_BLIND_INDEX_INFO`, used only
+  by the legacy scope. The old name remains as a deprecated alias.
+- Format and key-derivation pins in `crypto/scope.test.ts`. If they
+  break, stored data would break too.
+
+## Next - scoped worker access
+
+`createInternalRoutes` / `createVaultWorkerClient` still serve only the
+legacy scope, with one shared secret. Plan: the worker names a scope on
+each call, and the API maps each scope to its own secret, so a worker
+for one feature can't decrypt another's data.
+
+Also still open:
+- The vault's own `vault_unlock_method.label` is written in the legacy
+  format, and could move to an internal scope. That needs a data
+  migration, so it isn't urgent.
+- No re-encryption helper (legacy to scope) yet. Ebba can stay legacy
+  indefinitely; build the helper when something actually needs to move.
 
 ## v0.3 - storage-adapter abstraction (stretch, not started)
 

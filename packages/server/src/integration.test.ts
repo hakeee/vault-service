@@ -47,6 +47,7 @@ import { createRequireAuth } from "./requireAuth.js";
 import { createAuthRoutes } from "./routes/auth.js";
 import { createInternalRoutes } from "./routes/internal.js";
 import { createVaultRoutes } from "./routes/vault.js";
+import { migrateVaultService } from "./migrate.js";
 import * as schema from "./schema.js";
 import { createSessionCache } from "./sessionCache.js";
 import type { AuthMode } from "./auth/mode.js";
@@ -55,38 +56,9 @@ const WORKER_SECRET = "test-worker-secret";
 
 function createTestDb() {
   const sqlite = new Database(":memory:");
-  sqlite.exec(`
-    CREATE TABLE user (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      display_name TEXT NOT NULL,
-      email TEXT NOT NULL UNIQUE,
-      created_at INTEGER NOT NULL
-    );
-    CREATE TABLE user_identity (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL REFERENCES user(id),
-      provider TEXT NOT NULL,
-      issuer TEXT,
-      subject TEXT,
-      password_hash TEXT
-    );
-    CREATE TABLE vault_unlock_method (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL REFERENCES user(id),
-      method TEXT NOT NULL,
-      label BLOB,
-      wrapped_dek BLOB NOT NULL,
-      kdf_salt BLOB,
-      kdf_params TEXT,
-      credential_id TEXT,
-      public_key BLOB,
-      counter INTEGER,
-      prf_salt BLOB,
-      created_at INTEGER NOT NULL,
-      last_used_at INTEGER
-    );
-  `);
-  return drizzle(sqlite, { schema });
+  const db = drizzle(sqlite, { schema });
+  migrateVaultService(db);
+  return db;
 }
 
 function buildTestApp(mode: AuthMode) {

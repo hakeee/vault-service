@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { decryptField, encryptField } from "../crypto/aes.js";
-import type { SessionCache } from "../sessionCache.js";
+import { sessionCacheInternals, type SessionCache } from "../sessionCache.js";
 
 const WORKER_SECRET_HEADER = "x-worker-secret";
 
@@ -28,15 +28,17 @@ export interface InternalRoutesConfig {
 
 /**
  * The generic half of a "worker-safe" crypto service: decrypt/encrypt
- * against a cached session's DEK, nothing domain-specific. An app with
+ * against a cached session's vault, nothing domain-specific. For now these
+ * serve the legacy scope only (unversioned format, raw DEK); scoped worker
+ * access, with a secret per scope, is the next step (ROADMAP). An app with
  * its own encrypted-and-indexed domain data (e.g. blind-indexed tag
- * lookups) should add its own routes alongside these in its own app,
- * using this package's exported `blindIndex`/`deriveBlindIndexKey` and
- * `sessionCache.getSession` directly, rather than trying to make this
- * package own domain logic it has no business knowing about.
+ * lookups) adds its own routes alongside these, using
+ * `sessionCache.getVault(sessionId)`, rather than this package owning
+ * domain logic it has no business knowing about.
  */
 export function createInternalRoutes(config: InternalRoutesConfig) {
   const { workerSecret, sessionCache } = config;
+  const { getSession } = sessionCacheInternals(sessionCache);
 
   return async function internalRoutes(app: FastifyInstance) {
     app.addHook("onRequest", async (request, reply) => {
@@ -48,7 +50,7 @@ export function createInternalRoutes(config: InternalRoutesConfig) {
 
     app.post("/decrypt", async (request, reply) => {
       const { sessionId, ciphertext } = decryptBodySchema.parse(request.body);
-      const session = sessionCache.getSession(sessionId);
+      const session = getSession(sessionId);
 
       if (!session) {
         reply.code(404).send({ error: "vault locked" });
@@ -63,7 +65,7 @@ export function createInternalRoutes(config: InternalRoutesConfig) {
     // once - avoids one HTTP round trip per row.
     app.post("/decrypt-batch", async (request, reply) => {
       const { sessionId, ciphertexts } = decryptBatchBodySchema.parse(request.body);
-      const session = sessionCache.getSession(sessionId);
+      const session = getSession(sessionId);
 
       if (!session) {
         reply.code(404).send({ error: "vault locked" });
@@ -78,7 +80,7 @@ export function createInternalRoutes(config: InternalRoutesConfig) {
 
     app.post("/encrypt", async (request, reply) => {
       const { sessionId, plaintext } = encryptBodySchema.parse(request.body);
-      const session = sessionCache.getSession(sessionId);
+      const session = getSession(sessionId);
 
       if (!session) {
         reply.code(404).send({ error: "vault locked" });

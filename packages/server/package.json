@@ -1,6 +1,6 @@
 {
   "name": "@hakeee/vault-service",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -14,8 +14,9 @@
   "types": "./src/index.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "generate": "drizzle-kit generate"
   },
   "dependencies": {
     "@node-rs/argon2": "^2.2.2",
@@ -25,16 +26,23 @@
     "zod": "^4.2.0"
   },
   "peerDependencies": {
-    "fastify": "^5.5.0",
-    "@fastify/secure-session": "^8.1.1"
+    "@fastify/secure-session": "^8.1.1",
+    "fastify": "^5.5.0"
   },
   "devDependencies": {
     "@fastify/secure-session": "^8.1.1",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.0.0",
     "better-sqlite3": "^13.0.3",
+    "drizzle-kit": "^0.31.11",
     "fastify": "^5.5.0",
     "typescript": "^6.0.2",
     "vitest": "^5.0.4"
-  }
+  },
+  "files": [
+    "dist",
+    "src",
+    "migrations",
+    "!src/**/*.test.ts"
+  ]
 }

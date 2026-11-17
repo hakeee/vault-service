@@ -1,12 +1,16 @@
 import { createHmac, hkdfSync } from "node:crypto";
 
 /**
- * Kept unchanged from the Ebba codebase this library was extracted from -
- * changing it would silently invalidate every blind index already stored
- * under it. Other consumers of this package should pass their own `info`
- * to namespace their own derivation instead of relying on this default.
+ * The blind-index derivation used before scopes existed. It's kept
+ * unchanged from the Ebba codebase this library was extracted from,
+ * because changing it would invalidate every blind index already stored
+ * under it. Only the legacy scope uses it; named scopes derive their own
+ * index keys (see ./scope.ts).
  */
-export const DEFAULT_BLIND_INDEX_INFO = "ebba:blind-index:v1";
+export const LEGACY_BLIND_INDEX_INFO = "ebba:blind-index:v1";
+
+/** @deprecated Renamed to `LEGACY_BLIND_INDEX_INFO`. New code should use a named vault scope. */
+export const DEFAULT_BLIND_INDEX_INFO = LEGACY_BLIND_INDEX_INFO;
 
 /**
  * Derived from the DEK via HKDF rather than stored as its own wrapped
@@ -14,7 +18,7 @@ export const DEFAULT_BLIND_INDEX_INFO = "ebba:blind-index:v1";
  * at unlock", without an extra storage row: it's only computable once
  * the DEK itself is unwrapped.
  */
-export function deriveBlindIndexKey(dek: Buffer, info: string = DEFAULT_BLIND_INDEX_INFO): Buffer {
+export function deriveBlindIndexKey(dek: Buffer, info: string = LEGACY_BLIND_INDEX_INFO): Buffer {
   return Buffer.from(hkdfSync("sha256", dek, Buffer.alloc(0), info, 32));
 }
 

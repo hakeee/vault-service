@@ -12,7 +12,6 @@ import {
   type WebauthnConfig,
 } from "../crypto/webauthn.js";
 import { decryptField, encryptField } from "../crypto/aes.js";
-import { deriveBlindIndexKey } from "../crypto/blindIndex.js";
 import {
   createPasswordUnlockMethod,
   unlockWithPasskey,
@@ -25,7 +24,7 @@ import type { KdfParams } from "../crypto/kek.js";
 import type { AuthMode } from "../auth/mode.js";
 import { user, vaultUnlockMethod } from "../schema.js";
 import { typedSession } from "../session.js";
-import type { SessionCache } from "../sessionCache.js";
+import { sessionCacheInternals, type SessionCache } from "../sessionCache.js";
 
 const unlockBodySchema = z.object({ password: z.string().min(1) });
 const registerPasskeyBodySchema = z.object({
@@ -68,14 +67,14 @@ interface UnlockedVault {
  */
 export function createVaultRoutes(config: VaultRoutesConfig) {
   const { db, mode, webauthn, noneMode, sessionCache } = config;
-  const { cacheSession, getSession } = sessionCache;
+  const { cacheSession, getSession } = sessionCacheInternals(sessionCache);
 
   /** Caches the session the same way for every unlock path (password, passkey, bootstrap). */
   function startSession(request: FastifyRequest, unlocked: UnlockedVault): void {
     const session = typedSession(request);
     const sessionId = session.get("id") ?? randomUUID();
     session.set("id", sessionId);
-    cacheSession(sessionId, unlocked.userId, unlocked.dek, deriveBlindIndexKey(unlocked.dek));
+    cacheSession(sessionId, unlocked.userId, unlocked.dek);
   }
 
   /** The vault must already be unlocked to register a passkey - it wraps *this session's* DEK. */
