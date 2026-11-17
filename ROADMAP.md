@@ -75,7 +75,9 @@ the provider, no CSS - a consumer brings its own screens.
 scopes' keys (never the DEK or the legacy scope), optionally limited by a
 secret per scope, and caches them with a TTL. Secrets are compared in
 constant time. Tested over a real socket, round-tripping data with the
-API's own scopes.
+API's own scopes. `sessionCache.unlockedSessions()` lists who's unlocked
+(ids only, without extending idle timeouts), for schedulers such as
+module-host's `activeCallers`.
 
 Also still open:
 - The vault's own `vault_unlock_method.label` is written in the legacy

@@ -103,6 +103,16 @@ export function createSessionCache(idleTimeoutMs: number) {
       return getSession(sessionId) !== undefined;
     },
 
+    /**
+     * Who's unlocked right now: `{ userId, sessionId }` per live session -
+     * ids only, never keys. Doesn't extend anyone's idle timeout (a
+     * background scheduler listing sessions isn't the user being active).
+     */
+    unlockedSessions(): { userId: number; sessionId: string }[] {
+      const now = Date.now();
+      return [...sessions].filter(([, s]) => s.expiresAt >= now).map(([sessionId, s]) => ({ userId: s.userId, sessionId }));
+    },
+
     dropSession(sessionId: string): void {
       sessions.delete(sessionId);
     },

@@ -52,6 +52,20 @@ describe("session cache", () => {
     expect(cache.getVault("s1")).toBeUndefined();
   });
 
+  it("lists unlocked sessions without extending their idle timeout", () => {
+    vi.useFakeTimers();
+    const cache = createSessionCache(1_000);
+    sessionCacheInternals(cache).cacheSession("s1", 1, generateDek());
+    sessionCacheInternals(cache).cacheSession("s2", 2, generateDek());
+    vi.advanceTimersByTime(600);
+    expect(cache.unlockedSessions()).toEqual([
+      { userId: 1, sessionId: "s1" },
+      { userId: 2, sessionId: "s2" },
+    ]);
+    vi.advanceTimersByTime(500); // listing didn't extend them
+    expect(cache.unlockedSessions()).toEqual([]);
+  });
+
   it("refuses foreign objects as a cache", () => {
     expect(() => sessionCacheInternals({} as never)).toThrow();
   });
