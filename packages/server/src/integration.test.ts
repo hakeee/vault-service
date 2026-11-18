@@ -207,6 +207,47 @@ describe("mode: single - login", () => {
   });
 });
 
+describe("mode: single - lock", () => {
+  let app: ReturnType<typeof Fastify>;
+
+  beforeEach(async () => {
+    ({ app } = buildTestApp("single"));
+    await app.ready();
+  });
+
+  it("locks the vault but keeps the login", async () => {
+    const loginRes = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      payload: { email: "me@example.com", password: "correct horse battery staple" },
+    });
+    let cookie = loginRes.cookies[0]!;
+    const unlockRes = await app.inject({
+      method: "POST",
+      url: "/vault/unlock",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { password: "vault passphrase" },
+    });
+    cookie = unlockRes.cookies[0] ?? cookie;
+
+    const lockRes = await app.inject({ method: "POST", url: "/vault/lock", cookies: { [cookie.name]: cookie.value } });
+    expect(lockRes.statusCode).toBe(200);
+    cookie = lockRes.cookies[0] ?? cookie;
+
+    const statusRes = await app.inject({ method: "GET", url: "/vault/status", cookies: { [cookie.name]: cookie.value } });
+    expect(statusRes.statusCode).toBe(200);
+    expect(statusRes.json()).toMatchObject({ unlocked: false, hasVault: true });
+
+    const relockRes = await app.inject({
+      method: "POST",
+      url: "/vault/unlock",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { password: "vault passphrase" },
+    });
+    expect(relockRes.statusCode).toBe(200);
+  });
+});
+
 describe("mode: oidc - callback resolution", () => {
   let app: ReturnType<typeof Fastify>;
 

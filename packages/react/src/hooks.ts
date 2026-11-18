@@ -67,6 +67,16 @@ export function useUnlockWithPassword(): UseMutationResult<{ status: string }, E
   });
 }
 
+/** Locks the vault but keeps the login; `useLogout` clears both. */
+export function useLockVault(): UseMutationResult<{ status: string }, Error, void> {
+  const client = useVaultServiceClient();
+  const invalidate = useInvalidateVaultStatus();
+  return useMutation({
+    mutationFn: () => client.request("/vault/lock", { method: "POST" }),
+    onSuccess: invalidate,
+  });
+}
+
 export function useUnlockWithPasskey(): UseMutationResult<void, Error, void> {
   const client = useVaultServiceClient();
   const invalidate = useInvalidateVaultStatus();

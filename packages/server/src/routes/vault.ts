@@ -224,6 +224,15 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       return { status: "unlocked" };
     });
 
+    // Drops this session's DEK but keeps the login, so the next visit only
+    // asks for an unlock method. Logout is the heavier step: it also clears
+    // the login.
+    app.post("/lock", async (request) => {
+      const sessionId = typedSession(request).get("id");
+      if (sessionId !== undefined) sessionCache.dropSession(sessionId);
+      return { status: "locked" };
+    });
+
     app.post("/unlock-with-recovery", async (request, reply) => {
       const { recoveryKey } = recoveryKeyBodySchema.parse(request.body);
       const userId = await resolveOrCreateUserIdForUnlock(request);
