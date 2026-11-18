@@ -134,7 +134,8 @@ export function useRevokeVaultMethod(): UseMutationResult<{ status: string }, Er
   return useMutation({
     mutationFn: (id: number) => client.request(`/vault/methods/${id}`, { method: "DELETE" }),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["vaultService", "vaultMethods"] });
+      // Status too: hasPasskey / hasRecoveryKey may have just flipped.
+      void queryClient.invalidateQueries({ queryKey: ["vaultService"] });
     },
   });
 }

@@ -503,4 +503,36 @@ describe("passkey and recovery-key unlock methods", () => {
     });
     expect(wrongRes.statusCode).toBe(401);
   });
+
+  it("won't remove a method while locked", async () => {
+    await app.inject({
+      method: "POST",
+      url: "/vault/methods/recovery",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { recoveryKey: "Ab3x-K9fZ-Qp7w-Tz1m-Lk5j-Nc8h-Rv2d-Xg4y" },
+    });
+    const methodsRes = await app.inject({ method: "GET", url: "/vault/methods", cookies: { [cookie.name]: cookie.value } });
+    const recovery = (methodsRes.json() as { methods: { id: number; method: string }[] }).methods.find((m) => m.method === "recovery")!;
+
+    const lockRes = await app.inject({ method: "POST", url: "/vault/lock", cookies: { [cookie.name]: cookie.value } });
+    const locked = lockRes.cookies[0] ?? cookie;
+
+    const deleteRes = await app.inject({ method: "DELETE", url: `/vault/methods/${recovery.id}`, cookies: { [locked.name]: locked.value } });
+    expect(deleteRes.statusCode).toBe(404);
+
+    const unlockRes = await app.inject({
+      method: "POST",
+      url: "/vault/unlock",
+      cookies: { [locked.name]: locked.value },
+      payload: { password: "correct horse battery staple" },
+    });
+    expect(unlockRes.statusCode).toBe(200);
+    const unlocked = unlockRes.cookies[0] ?? locked;
+    const deleteUnlockedRes = await app.inject({
+      method: "DELETE",
+      url: `/vault/methods/${recovery.id}`,
+      cookies: { [unlocked.name]: unlocked.value },
+    });
+    expect(deleteUnlockedRes.statusCode).toBe(200);
+  });
 });

@@ -444,8 +444,12 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       return { status: "registered" };
     });
 
+    // Needs an unlocked vault, not just a login: otherwise a stolen cookie,
+    // which can't read anything, could still delete the recovery key.
     app.delete("/methods/:id", async (request, reply) => {
-      const userId = await resolveUserIdForStatus(request);
+      const session = getSessionOrReject(request, reply);
+      if (!session) return;
+      const userId = session.userId;
       const { id } = z.object({ id: z.coerce.number().int() }).parse(request.params);
 
       const [methodRow] = await db.select().from(vaultUnlockMethod).where(eq(vaultUnlockMethod.id, id));
