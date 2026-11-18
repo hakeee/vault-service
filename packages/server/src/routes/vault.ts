@@ -369,6 +369,13 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
         reply.code(401).send({ error: "unknown passkey" });
         return;
       }
+      // Looked up by credential id alone, so without this a logged-in user
+      // could unlock someone else's vault into their own session.
+      const expectedUserId = await resolveUserIdForStatus(request);
+      if (expectedUserId !== undefined && methodRow.userId !== expectedUserId) {
+        reply.code(401).send({ error: "unknown passkey" });
+        return;
+      }
       const storedCounter = methodRow.counter ?? 0;
 
       let verified: { newCounter: number };

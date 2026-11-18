@@ -248,6 +248,91 @@ describe("mode: single - lock", () => {
   });
 });
 
+describe("mode: single - passkey ownership", () => {
+  let app: ReturnType<typeof Fastify>;
+
+  beforeEach(async () => {
+    ({ app } = buildTestApp("single"));
+    await app.ready();
+  });
+
+  /** Logs in, unlocks, registers one passkey; returns the logged-in cookie. */
+  async function userWithPasskey(email: string, credentialId: string) {
+    const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email, password: "pw" } });
+    let cookie = loginRes.cookies[0]!;
+    const unlockRes = await app.inject({
+      method: "POST",
+      url: "/vault/unlock",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { password: "pass" },
+    });
+    cookie = unlockRes.cookies[0] ?? cookie;
+
+    vi.mocked(createPasskeyRegistrationChallenge).mockResolvedValueOnce({
+      options: { challenge: "reg" } as never,
+      challenge: "reg",
+      prfSalt: "cHJmLXNhbHQ",
+    });
+    const optionsRes = await app.inject({
+      method: "POST",
+      url: "/vault/methods/passkey/register-options",
+      cookies: { [cookie.name]: cookie.value },
+    });
+    cookie = optionsRes.cookies[0] ?? cookie;
+
+    vi.mocked(verifyPasskeyRegistration).mockResolvedValueOnce({
+      credentialId,
+      publicKey: Buffer.from(`pk-${credentialId}`),
+      counter: 0,
+    });
+    const registerRes = await app.inject({
+      method: "POST",
+      url: "/vault/methods/passkey",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { response: {}, prfOutput: "cHJmLW91dA", label: "device" },
+    });
+    expect(registerRes.statusCode).toBe(200);
+    return registerRes.cookies[0] ?? cookie;
+  }
+
+  it("rejects another user's passkey", async () => {
+    let cookie = await userWithPasskey("a@example.com", "cred-a");
+    await userWithPasskey("b@example.com", "cred-b");
+
+    const lockRes = await app.inject({ method: "POST", url: "/vault/lock", cookies: { [cookie.name]: cookie.value } });
+    cookie = lockRes.cookies[0] ?? cookie;
+
+    vi.mocked(createPasskeyAuthenticationChallenge).mockResolvedValueOnce({
+      options: { challenge: "auth" } as never,
+      challenge: "auth",
+      prfSaltByCredentialId: { "cred-a": "cHJmLXNhbHQ" },
+    });
+    const optionsRes = await app.inject({
+      method: "GET",
+      url: "/vault/methods/passkey/auth-options",
+      cookies: { [cookie.name]: cookie.value },
+    });
+    cookie = optionsRes.cookies[0] ?? cookie;
+
+    vi.mocked(verifyPasskeyAuthentication).mockResolvedValue({ newCounter: 0 });
+    const foreignRes = await app.inject({
+      method: "POST",
+      url: "/vault/methods/passkey/auth-verify",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { response: { id: "cred-b" }, prfOutput: "cHJmLW91dA" },
+    });
+    expect(foreignRes.statusCode).toBe(401);
+
+    const ownRes = await app.inject({
+      method: "POST",
+      url: "/vault/methods/passkey/auth-verify",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { response: { id: "cred-a" }, prfOutput: "cHJmLW91dA" },
+    });
+    expect(ownRes.statusCode).toBe(200);
+  });
+});
+
 describe("mode: oidc - callback resolution", () => {
   let app: ReturnType<typeof Fastify>;
 
