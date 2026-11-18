@@ -17,6 +17,17 @@ import { randomUUID } from "node:crypto";
 import type { SessionCache } from "../sessionCache.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
+const changePasswordBodySchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(8) });
+
+/** Handed to `onLogin` after every successful login. */
+export interface LoginEvent {
+  userId: number;
+  /** This login created the account (open signup, a first OIDC login, or the very first account). */
+  created: boolean;
+  provider: "local" | "oidc";
+  /** The ID token's claims, for OIDC logins - e.g. to map IdP roles. */
+  claims?: Record<string, unknown>;
+}
 
 export interface AuthRoutesConfig {
   db: BetterSQLite3Database<any>;
@@ -31,6 +42,17 @@ export interface AuthRoutesConfig {
    * still use the vault until then.
    */
   sessionCache?: SessionCache;
+  /**
+   * Whether logging in with an unknown account creates it. `"open"`
+   * (default): the first login for an email (or an OIDC identity) creates
+   * the account. `"closed"`: only the very first account is created this
+   * way - it becomes the owner - and the rest are created by the app (see
+   * `createAccountStore`), or linked by email for OIDC. Invite links and
+   * other providers can build on `"closed"` later.
+   */
+  signup?: "open" | "closed";
+  /** Runs after every successful login, before the response - e.g. IAM role mapping. */
+  onLogin?: (event: LoginEvent) => void | Promise<void>;
 }
 
 /**
@@ -40,7 +62,8 @@ export interface AuthRoutesConfig {
  * set).
  */
 export function createAuthRoutes(config: AuthRoutesConfig) {
-  const { db, mode, oidc, postLoginRedirectUrl, sessionCache } = config;
+  const { db, mode, oidc, postLoginRedirectUrl, sessionCache, onLogin } = config;
+  const signupOpen = async () => config.signup !== "closed" || (await db.select({ id: user.id }).from(user).limit(1)).length === 0;
 
   // Discovery hits the issuer over the network - cached for the process
   // lifetime, same idea as the DEK cache avoiding redoing expensive setup
@@ -84,6 +107,11 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       // First login for this email bootstraps it - mirrors routes/vault.ts's
       // "first unlock creates the vault" shape, one level up the stack.
       if (!existingUser) {
+        // Same answer as a wrong password, so closed signup doesn't reveal which emails exist.
+        if (!(await signupOpen())) {
+          reply.code(401).send({ error: "wrong email or password" });
+          return;
+        }
         const passwordHash = await hashPassword(password);
         const [createdUser] = await db
           .insert(user)
@@ -94,6 +122,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         await db.insert(userIdentity).values({ userId: createdUser.id, provider: "local", passwordHash });
 
         startLogin(typedSession(request), createdUser.id);
+        await onLogin?.({ userId: createdUser.id, created: true, provider: "local" });
         return { status: "logged_in" };
       }
 
@@ -108,7 +137,32 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       }
 
       startLogin(typedSession(request), existingUser.id);
+      await onLogin?.({ userId: existingUser.id, created: false, provider: "local" });
       return { status: "logged_in" };
+    });
+
+    /** Changes the caller's own login password (single mode). Not the vault passphrase - that's `PUT /vault/methods/password`. */
+    app.post("/password", async (request, reply) => {
+      if (mode !== "single") {
+        reply.code(404).send({ error: 'auth mode is not "single"' });
+        return;
+      }
+      const authUserId = typedSession(request).get("authUserId");
+      if (authUserId === undefined) {
+        reply.code(401).send({ error: "login required" });
+        return;
+      }
+      const { currentPassword, newPassword } = changePasswordBodySchema.parse(request.body);
+      const [identity] = await db
+        .select()
+        .from(userIdentity)
+        .where(and(eq(userIdentity.userId, Number(authUserId)), eq(userIdentity.provider, "local")));
+      if (!identity?.passwordHash || !(await verifyPasswordHash(identity.passwordHash, currentPassword))) {
+        reply.code(401).send({ error: "wrong password" });
+        return;
+      }
+      await db.update(userIdentity).set({ passwordHash: await hashPassword(newPassword) }).where(eq(userIdentity.id, identity.id));
+      return { status: "changed" };
     });
 
     app.get("/oidc/login", async (request, reply) => {
@@ -199,6 +253,10 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         });
         authUserId = resolution.userId;
       } else {
+        if (!(await signupOpen())) {
+          reply.code(403).send({ error: "signup is closed - ask for an account" });
+          return;
+        }
         const email = claims.email ?? `${claims.subject}@${claims.issuer}`;
         const [createdUser] = await db
           .insert(user)
@@ -216,6 +274,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       }
 
       startLogin(session, authUserId);
+      await onLogin?.({ userId: authUserId, created: resolution.action === "create", provider: "oidc", claims: claims.raw });
       session.set("oidcState", "");
       session.set("oidcNonce", "");
       session.set("oidcCodeVerifier", "");

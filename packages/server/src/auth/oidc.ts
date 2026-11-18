@@ -89,5 +89,6 @@ export async function handleOidcCallback(
     email: typeof claims.email === "string" ? claims.email : undefined,
     emailVerified: claims.email_verified === true,
     isAuthorized: isAuthorizedClaims(claims as Record<string, unknown>),
+    raw: { ...(claims as Record<string, unknown>) },
   };
 }

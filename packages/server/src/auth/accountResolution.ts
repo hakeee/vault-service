@@ -11,6 +11,8 @@ export interface OidcClaims {
    * login is allowed unless the caller supplies a stricter predicate.
    */
   isAuthorized: boolean;
+  /** Every claim of the ID token, e.g. for mapping IdP roles in `onLogin`. */
+  raw?: Record<string, unknown>;
 }
 
 /** What the caller found by querying its own storage before calling resolveOidcAccount. */

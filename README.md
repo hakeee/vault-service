@@ -126,6 +126,23 @@ login and the rest after unlock:
 - Logging in starts a fresh session id, so a vault left unlocked by an
   earlier login in the same browser doesn't carry over.
 
+## Accounts and signup
+
+- `createAuthRoutes({ signup: "closed" })`: only the very first account
+  signs itself up (it becomes the owner). After that, `single` mode logins
+  for unknown emails get the same 401 as a wrong password, and new OIDC
+  identities get a 403, unless their email matches an existing account,
+  in which case they're linked. Default `"open"` keeps the old behavior.
+- `createAccountStore(db)` (`list`, `create`) is for apps that create
+  accounts themselves, e.g. module-host's IAM. It sets a login password
+  only. The person picks their own vault passphrase on first unlock.
+- `onLogin(event)` runs after every login with `{ userId, created,
+  provider, claims? }`. OIDC logins include the ID token's claims, e.g.
+  for mapping IdP roles.
+- `POST /auth/password` (`useChangeLoginPassword`) changes your own login
+  password, checking the current one. It's separate from the vault
+  passphrase.
+
 ## Database
 
 This package owns the `user`, `user_identity` and `vault_unlock_method`

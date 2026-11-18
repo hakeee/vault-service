@@ -45,6 +45,7 @@ import {
 import { handleOidcCallback } from "./auth/oidc.js";
 import { createRequireAuth } from "./requireAuth.js";
 import { createRequireCaller } from "./requireCaller.js";
+import { createAccountStore } from "./accounts.js";
 import { createRequireVault } from "./requireVault.js";
 import { createAuthRoutes } from "./routes/auth.js";
 import { createInternalRoutes } from "./routes/internal.js";
@@ -63,7 +64,7 @@ function createTestDb() {
   return db;
 }
 
-function buildTestApp(mode: AuthMode) {
+function buildTestApp(mode: AuthMode, authExtra: Partial<Parameters<typeof createAuthRoutes>[0]> = {}) {
   const db = createTestDb();
   const sessionCache = createSessionCache(30 * 60 * 1000);
 
@@ -87,6 +88,7 @@ function buildTestApp(mode: AuthMode) {
           : undefined,
       postLoginRedirectUrl: "http://localhost:5173",
       sessionCache,
+      ...authExtra,
     }),
     { prefix: "/auth" },
   );
@@ -333,6 +335,49 @@ describe("mode: single - caller without the vault", () => {
   });
 });
 
+describe("mode: single - closed signup, onLogin, accounts", () => {
+  const login = (app: ReturnType<typeof Fastify>, email: string, password = "pw", cookie?: { name: string; value: string }) =>
+    app.inject({ method: "POST", url: "/auth/login", payload: { email, password }, cookies: cookie ? { [cookie.name]: cookie.value } : {} });
+
+  it("lets only the first account sign up, then only accounts the app created", async () => {
+    const events: unknown[] = [];
+    const { app, db } = buildTestApp("single", { signup: "closed", onLogin: (e) => void events.push(e) });
+    await app.ready();
+
+    expect((await login(app, "owner@example.com")).statusCode).toBe(200);
+    expect((await login(app, "stranger@example.com")).json()).toEqual({ error: "wrong email or password" });
+
+    const accounts = createAccountStore(db);
+    const created = await accounts.create({ email: "new@example.com", password: "temporary1", displayName: "New" });
+    expect(created).toEqual({ id: 2 });
+    expect(await accounts.create({ email: "new@example.com", password: "x", displayName: "x" })).toEqual({ error: "email-taken" });
+    expect((await accounts.list()).map((a) => a.email)).toEqual(["owner@example.com", "new@example.com"]);
+    expect((await login(app, "new@example.com", "temporary1")).statusCode).toBe(200);
+
+    expect(events).toEqual([
+      { userId: 1, created: true, provider: "local" },
+      { userId: 2, created: false, provider: "local" },
+    ]);
+  });
+
+  it("changes the login password, checking the current one", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    const cookie = (await login(app, "me@example.com", "first-password")).cookies[0]!;
+    const change = (currentPassword: string) =>
+      app.inject({
+        method: "POST",
+        url: "/auth/password",
+        cookies: { [cookie.name]: cookie.value },
+        payload: { currentPassword, newPassword: "second-password" },
+      });
+    expect((await change("wrong")).statusCode).toBe(401);
+    expect((await change("first-password")).statusCode).toBe(200);
+    expect((await login(app, "me@example.com", "first-password")).statusCode).toBe(401);
+    expect((await login(app, "me@example.com", "second-password")).statusCode).toBe(200);
+  });
+});
+
 describe("mode: single - passkey ownership", () => {
   let app: ReturnType<typeof Fastify>;
 
@@ -415,6 +460,32 @@ describe("mode: single - passkey ownership", () => {
       payload: { response: { id: "cred-a" }, prfOutput: "cHJmLW91dA" },
     });
     expect(ownRes.statusCode).toBe(200);
+  });
+});
+
+describe("mode: oidc - closed signup and onLogin", () => {
+  it("refuses new identities once an account exists, links existing emails, and hands claims to onLogin", async () => {
+    const events: { created: boolean; claims?: Record<string, unknown> }[] = [];
+    const { app } = buildTestApp("oidc", { signup: "closed", onLogin: (e) => void events.push(e) });
+    await app.ready();
+    const callback = async (subject: string, email: string) => {
+      vi.mocked(handleOidcCallback).mockResolvedValueOnce({
+        issuer: "https://idp.example.com",
+        subject,
+        email,
+        emailVerified: true,
+        isAuthorized: true,
+        raw: { sub: subject, roles: ["admin"] },
+      });
+      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+      return app.inject({ method: "GET", url: "/auth/oidc/callback?code=c&state=test-state", cookies: { [cookie.name]: cookie.value } });
+    };
+
+    expect((await callback("first", "owner@example.com")).statusCode).toBe(302); // the very first account
+    expect((await callback("second", "stranger@example.com")).statusCode).toBe(403);
+    expect((await callback("first", "owner@example.com")).statusCode).toBe(302); // known identity: fine
+    expect(events.map((e) => e.created)).toEqual([true, false]);
+    expect(events[0]!.claims).toEqual({ sub: "first", roles: ["admin"] });
   });
 });
 

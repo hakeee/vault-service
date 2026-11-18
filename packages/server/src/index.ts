@@ -21,6 +21,7 @@ export { createSessionCache, type SessionCache, type VaultChange, type VaultHand
 export * from "./requireVault.js";
 export * from "./requireAuth.js";
 export * from "./requireCaller.js";
+export * from "./accounts.js";
 
 export * from "./routes/auth.js";
 export * from "./routes/vault.js";

@@ -49,6 +49,14 @@ export function useLogout(): UseMutationResult<{ status: string }, Error, void> 
   });
 }
 
+/** Changes the login password (single mode) - not the vault passphrase (`useChangePassword`). */
+export function useChangeLoginPassword(): UseMutationResult<{ status: string }, Error, { currentPassword: string; newPassword: string }> {
+  const client = useVaultServiceClient();
+  return useMutation({
+    mutationFn: (body) => client.request("/auth/password", { method: "POST", body: JSON.stringify(body) }),
+  });
+}
+
 /** Full-page navigation, not a fetch - the IdP's login page isn't something the client's request() can handle. */
 export function useOidcLoginUrl(): string {
   const client = useVaultServiceClient();
