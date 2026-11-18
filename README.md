@@ -105,6 +105,27 @@ sandbox: code in the same process could still reach the session cache.
 A feature you don't trust has to run in its own process, the way the
 worker does.
 
+## Logged in but locked
+
+Login and unlock are separate, so an app can show some things after
+login and the rest after unlock:
+
+- `createRequireCaller({ db, mode, noneMode })` is a request gate like
+  `createRequireVault`, but needs only a login. It returns `{ userId,
+  sessionId }`, or replies 401 itself. The session id exists from login
+  onward, and the vault unlocks under that same id. Anything served
+  through it is readable by whoever holds the cookie, so never return
+  vault-encrypted data from it.
+- `sessionCache.onChange(listener)` reports `{ sessionId, userId,
+  unlocked }` on every unlock, lock, logout and idle timeout. An idle
+  timeout is noticed on the next read or sweep, so up to a minute late.
+  module-host uses it to tell open tabs right away.
+- Lock with `POST /vault/lock` (`useLockVault`). It keeps the login. In
+  React, `useRefreshVaultState()` re-checks both states, e.g. when a
+  socket reports a lock.
+- Logging in starts a fresh session id, so a vault left unlocked by an
+  earlier login in the same browser doesn't carry over.
+
 ## Database
 
 This package owns the `user`, `user_identity` and `vault_unlock_method`

@@ -17,9 +17,10 @@ export * from "./auth/oidc.js";
 export * from "./schema.js";
 export * from "./migrate.js";
 export * from "./session.js";
-export { createSessionCache, type SessionCache, type VaultHandle } from "./sessionCache.js";
+export { createSessionCache, type SessionCache, type VaultChange, type VaultHandle } from "./sessionCache.js";
 export * from "./requireVault.js";
 export * from "./requireAuth.js";
+export * from "./requireCaller.js";
 
 export * from "./routes/auth.js";
 export * from "./routes/vault.js";

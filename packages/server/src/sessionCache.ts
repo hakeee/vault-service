@@ -32,6 +32,13 @@ export interface SessionCacheInternals {
 
 const SWEEP_INTERVAL_MS = 60_000;
 
+/** A session's vault became unlocked, or stopped being (lock, logout, idle timeout). */
+export interface VaultChange {
+  readonly sessionId: string;
+  readonly userId: number;
+  readonly unlocked: boolean;
+}
+
 const internalsByCache = new WeakMap<object, SessionCacheInternals>();
 
 /** @internal - deliberately not re-exported from the package index. */
@@ -73,9 +80,28 @@ export function createSessionCache(idleTimeoutMs: number) {
    * fresh store on top of the same process.
    */
   const sessions = new Map<string, CachedVaultSession>();
+  const listeners = new Set<(change: VaultChange) => void>();
+
+  function notify(change: VaultChange): void {
+    for (const listener of listeners) {
+      try {
+        listener(change);
+      } catch (error) {
+        console.error("vault-service: a session change listener threw", error);
+      }
+    }
+  }
+
+  function remove(sessionId: string): void {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+    sessions.delete(sessionId);
+    notify({ sessionId, userId: session.userId, unlocked: false });
+  }
 
   function cacheSession(sessionId: string, userId: number, dek: Buffer): void {
     sessions.set(sessionId, { userId, dek, expiresAt: Date.now() + idleTimeoutMs, scopeKeys: new Map() });
+    notify({ sessionId, userId, unlocked: true });
   }
 
   /** Reading a session resets its idle timeout - an active session shouldn't lock mid-use. */
@@ -84,7 +110,7 @@ export function createSessionCache(idleTimeoutMs: number) {
     if (!session) return undefined;
 
     if (session.expiresAt < Date.now()) {
-      sessions.delete(sessionId);
+      remove(sessionId);
       return undefined;
     }
 
@@ -114,7 +140,18 @@ export function createSessionCache(idleTimeoutMs: number) {
     },
 
     dropSession(sessionId: string): void {
-      sessions.delete(sessionId);
+      remove(sessionId);
+    },
+
+    /**
+     * Called whenever a session unlocks or locks (lock, logout, idle
+     * timeout - an idle timeout is noticed on the next read or sweep, so
+     * up to a minute late). Ids only, never keys. Returns an unsubscribe.
+     * module-host uses it to tell open tabs right away.
+     */
+    onChange(listener: (change: VaultChange) => void): () => void {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
     },
 
     /** Sweeps expired sessions periodically, independent of whether anyone reads them. */
@@ -122,7 +159,7 @@ export function createSessionCache(idleTimeoutMs: number) {
       return setInterval(() => {
         const now = Date.now();
         for (const [id, session] of sessions) {
-          if (session.expiresAt < now) sessions.delete(id);
+          if (session.expiresAt < now) remove(id);
         }
       }, SWEEP_INTERVAL_MS);
     },

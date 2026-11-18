@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, eq } from "drizzle-orm";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
@@ -24,7 +23,7 @@ import {
 import type { KdfParams } from "../crypto/kek.js";
 import type { AuthMode } from "../auth/mode.js";
 import { user, vaultUnlockMethod } from "../schema.js";
-import { typedSession } from "../session.js";
+import { ensureSessionId, typedSession } from "../session.js";
 import { sessionCacheInternals, type SessionCache } from "../sessionCache.js";
 
 const unlockBodySchema = z.object({ password: z.string().min(1) });
@@ -73,10 +72,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
 
   /** Caches the session the same way for every unlock path (password, passkey, bootstrap). */
   function startSession(request: FastifyRequest, unlocked: UnlockedVault): void {
-    const session = typedSession(request);
-    const sessionId = session.get("id") ?? randomUUID();
-    session.set("id", sessionId);
-    cacheSession(sessionId, unlocked.userId, unlocked.dek);
+    cacheSession(ensureSessionId(typedSession(request)), unlocked.userId, unlocked.dek);
   }
 
   /** The vault must already be unlocked to register a passkey - it wraps *this session's* DEK. */
@@ -203,9 +199,10 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
 
   return async function vaultRoutes(app: FastifyInstance) {
     app.get("/status", async (request) => {
-      const session = typedSession(request);
-      const sessionId = session.get("id");
-      const unlocked = sessionId !== undefined && getSession(sessionId) !== undefined;
+      // `none` mode has no login to set the id, and the live socket needs
+      // one before unlock; the app checks status first, so set it here.
+      const sessionId = ensureSessionId(typedSession(request));
+      const unlocked = getSession(sessionId) !== undefined;
 
       const userId = await resolveUserIdForStatus(request);
       const hasVault = userId !== undefined && (await hasPasswordVaultMethod(userId));

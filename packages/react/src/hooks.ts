@@ -4,6 +4,18 @@ import { registerPasskey as browserRegisterPasskey, unlockWithPasskey as browser
 import { useVaultServiceClient } from "./VaultServiceProvider.js";
 import type { AuthStatus, VaultMethod, VaultStatus } from "./types.js";
 
+/** The query key prefix of every hook here - invalidate it to re-check login and vault state from outside React. */
+export const vaultServiceQueryKey = ["vaultService"] as const;
+
+/**
+ * Re-checks login and vault state, e.g. when a live socket reports the
+ * vault locked or a request came back 423. `useVaultGate` follows.
+ */
+export function useRefreshVaultState(): () => void {
+  const queryClient = useQueryClient();
+  return () => void queryClient.invalidateQueries({ queryKey: vaultServiceQueryKey });
+}
+
 /** Checked before vault status - auth mode gates who can call the API at all, independent of vault unlock. */
 export function useAuthStatus(): UseQueryResult<AuthStatus> {
   const client = useVaultServiceClient();

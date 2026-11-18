@@ -12,7 +12,8 @@ import { hashPassword, verifyPasswordHash } from "../auth/password.js";
 import { resolveOidcAccount } from "../auth/accountResolution.js";
 import type { AuthMode } from "../auth/mode.js";
 import { user, userIdentity } from "../schema.js";
-import { typedSession } from "../session.js";
+import { typedSession, type TypedSession } from "../session.js";
+import { randomUUID } from "node:crypto";
 import type { SessionCache } from "../sessionCache.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
@@ -53,6 +54,18 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     return oidcClientPromise;
   }
 
+  /**
+   * Marks the session logged in with a fresh session id. Rotating it means
+   * a vault left unlocked under the old id (another login in this browser)
+   * can't carry over to the new one.
+   */
+  function startLogin(session: TypedSession, userId: number): void {
+    const oldId = session.get("id");
+    if (oldId) sessionCache?.dropSession(oldId);
+    session.set("id", randomUUID());
+    session.set("authUserId", String(userId));
+  }
+
   return async function authRoutes(app: FastifyInstance) {
     app.get("/status", async (request) => {
       const authUserId = typedSession(request).get("authUserId");
@@ -80,7 +93,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
         await db.insert(userIdentity).values({ userId: createdUser.id, provider: "local", passwordHash });
 
-        typedSession(request).set("authUserId", String(createdUser.id));
+        startLogin(typedSession(request), createdUser.id);
         return { status: "logged_in" };
       }
 
@@ -94,7 +107,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         return;
       }
 
-      typedSession(request).set("authUserId", String(existingUser.id));
+      startLogin(typedSession(request), existingUser.id);
       return { status: "logged_in" };
     });
 
@@ -202,7 +215,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         authUserId = createdUser.id;
       }
 
-      session.set("authUserId", String(authUserId));
+      startLogin(session, authUserId);
       session.set("oidcState", "");
       session.set("oidcNonce", "");
       session.set("oidcCodeVerifier", "");

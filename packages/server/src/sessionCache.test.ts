@@ -106,4 +106,32 @@ describe("requireVault", () => {
     const app = await appWith(404);
     expect((await app.inject({ method: "GET", url: "/secret" })).statusCode).toBe(404);
   });
+
+  it("tells listeners about unlocks, locks and idle timeouts", () => {
+    vi.useFakeTimers();
+    try {
+      const cache = createSessionCache(1000);
+      const changes: unknown[] = [];
+      const off = cache.onChange((c) => changes.push(c));
+      const { cacheSession } = sessionCacheInternals(cache);
+
+      cacheSession("s1", 1, generateDek());
+      cache.dropSession("s1");
+      cache.dropSession("s1"); // already gone: no second event
+      cacheSession("s2", 2, generateDek());
+      vi.advanceTimersByTime(1001);
+      expect(cache.isUnlocked("s2")).toBe(false);
+      off();
+      cacheSession("s3", 3, generateDek());
+
+      expect(changes).toEqual([
+        { sessionId: "s1", userId: 1, unlocked: true },
+        { sessionId: "s1", userId: 1, unlocked: false },
+        { sessionId: "s2", userId: 2, unlocked: true },
+        { sessionId: "s2", userId: 2, unlocked: false },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

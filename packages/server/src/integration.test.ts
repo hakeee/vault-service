@@ -44,6 +44,8 @@ import {
 } from "./crypto/webauthn.js";
 import { handleOidcCallback } from "./auth/oidc.js";
 import { createRequireAuth } from "./requireAuth.js";
+import { createRequireCaller } from "./requireCaller.js";
+import { createRequireVault } from "./requireVault.js";
 import { createAuthRoutes } from "./routes/auth.js";
 import { createInternalRoutes } from "./routes/internal.js";
 import { createVaultRoutes } from "./routes/vault.js";
@@ -90,8 +92,17 @@ function buildTestApp(mode: AuthMode) {
   );
   app.register(createInternalRoutes({ workerSecret: WORKER_SECRET, sessionCache }), { prefix: "/internal" });
 
+  const requireCaller = createRequireCaller({ db, mode, noneMode: { placeholderEmail: "local@test.internal" } });
+  const requireVault = createRequireVault(sessionCache);
+
   app.register(async (protectedRoutes) => {
     protectedRoutes.addHook("onRequest", requireAuth);
+    // Stand-ins for an app's own routes: one needing only a login, one the vault.
+    protectedRoutes.get("/whoami", async (request, reply) => requireCaller(request, reply));
+    protectedRoutes.get("/secret", async (request, reply) => {
+      const unlocked = requireVault(request, reply);
+      return unlocked && { sessionId: unlocked.sessionId, userId: unlocked.userId };
+    });
     protectedRoutes.register(
       createVaultRoutes({
         db,
@@ -269,6 +280,56 @@ describe("mode: single - logout", () => {
     const statusRes = await app.inject({ method: "GET", url: "/vault/status", cookies: { [oldCookie.name]: oldCookie.value } });
     expect(statusRes.statusCode).toBe(200);
     expect(statusRes.json()).toMatchObject({ unlocked: false });
+  });
+});
+
+describe("mode: single - caller without the vault", () => {
+  it("identifies a logged-in caller before unlock, under the id the vault later unlocks with", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    expect((await app.inject({ method: "GET", url: "/whoami" })).statusCode).toBe(401);
+
+    const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "pw" } });
+    let cookie = loginRes.cookies[0]!;
+    const whoRes = await app.inject({ method: "GET", url: "/whoami", cookies: { [cookie.name]: cookie.value } });
+    expect(whoRes.statusCode).toBe(200);
+    const who = whoRes.json() as { userId: number; sessionId: string };
+    expect(who.userId).toBeGreaterThan(0);
+    expect((await app.inject({ method: "GET", url: "/secret", cookies: { [cookie.name]: cookie.value } })).statusCode).toBe(423);
+
+    const unlockRes = await app.inject({
+      method: "POST",
+      url: "/vault/unlock",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { password: "pass" },
+    });
+    cookie = unlockRes.cookies[0] ?? cookie;
+    const secretRes = await app.inject({ method: "GET", url: "/secret", cookies: { [cookie.name]: cookie.value } });
+    expect(secretRes.json()).toEqual(who);
+  });
+
+  it("starts a new session id on login, so an unlocked vault doesn't carry over", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "a@example.com", password: "pw" } });
+    let cookie = loginRes.cookies[0]!;
+    const unlockRes = await app.inject({
+      method: "POST",
+      url: "/vault/unlock",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { password: "pass" },
+    });
+    cookie = unlockRes.cookies[0] ?? cookie;
+
+    // Another account logs in from the same browser without logging out first.
+    const secondRes = await app.inject({
+      method: "POST",
+      url: "/auth/login",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { email: "b@example.com", password: "pw" },
+    });
+    cookie = secondRes.cookies[0] ?? cookie;
+    expect((await app.inject({ method: "GET", url: "/secret", cookies: { [cookie.name]: cookie.value } })).statusCode).toBe(423);
   });
 });
 
