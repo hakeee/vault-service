@@ -140,6 +140,15 @@ export function useRevokeVaultMethod(): UseMutationResult<{ status: string }, Er
   });
 }
 
+/** Needs an unlocked vault; the old password isn't asked for (see the server route). */
+export function useChangePassword(): UseMutationResult<{ status: string }, Error, string> {
+  const client = useVaultServiceClient();
+  return useMutation({
+    mutationFn: (newPassword: string) =>
+      client.request("/vault/methods/password", { method: "PUT", body: JSON.stringify({ newPassword }) }),
+  });
+}
+
 // Re-exported so a consumer never needs to import @simplewebauthn/browser
 // itself just to type a passkey ceremony's response.
 export type { AuthenticationResponseJSON, RegistrationResponseJSON };

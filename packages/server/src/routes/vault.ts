@@ -18,6 +18,7 @@ import {
   unlockWithPassword,
   unlockWithRecovery,
   wrapDekForPasskey,
+  wrapDekForPassword,
   wrapDekForRecovery,
 } from "../crypto/vault.js";
 import type { KdfParams } from "../crypto/kek.js";
@@ -37,6 +38,7 @@ const authVerifyPasskeyBodySchema = z.object({
   prfOutput: z.string().min(1), // base64url
 });
 const recoveryKeyBodySchema = z.object({ recoveryKey: z.string().min(1) });
+const changePasswordBodySchema = z.object({ newPassword: z.string().min(1) });
 
 /** The frontend displays the key chunked with dashes for readability - cosmetic only, stripped before decoding. */
 function decodeRecoveryKey(value: string): Buffer {
@@ -442,6 +444,28 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       });
 
       return { status: "registered" };
+    });
+
+    // Re-wraps this session's DEK under a new password, so the data isn't
+    // touched. Doesn't ask for the old password: after a recovery-key unlock
+    // the user doesn't know it, and an unlocked session can already read
+    // everything the password protects.
+    app.put("/methods/password", async (request, reply) => {
+      const session = getSessionOrReject(request, reply);
+      if (!session) return;
+
+      const { newPassword } = changePasswordBodySchema.parse(request.body);
+      const method = await wrapDekForPassword(session.dek, newPassword);
+      const updated = await db
+        .update(vaultUnlockMethod)
+        .set({ wrappedDek: method.wrappedDek, kdfSalt: method.kdfSalt, kdfParams: JSON.stringify(method.kdfParams) })
+        .where(and(eq(vaultUnlockMethod.userId, session.userId), eq(vaultUnlockMethod.method, "password")))
+        .returning({ id: vaultUnlockMethod.id });
+      if (updated.length === 0) {
+        reply.code(500).send({ error: "no password unlock method found" });
+        return;
+      }
+      return { status: "changed" };
     });
 
     // Needs an unlocked vault, not just a login: otherwise a stolen cookie,

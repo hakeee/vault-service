@@ -504,7 +504,22 @@ describe("passkey and recovery-key unlock methods", () => {
     expect(wrongRes.statusCode).toBe(401);
   });
 
-  it("won't remove a method while locked", async () => {
+  it("changes the password, after which only the new one unlocks", async () => {
+    const changeRes = await app.inject({
+      method: "PUT",
+      url: "/vault/methods/password",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { newPassword: "new passphrase" },
+    });
+    expect(changeRes.statusCode).toBe(200);
+
+    const oldRes = await app.inject({ method: "POST", url: "/vault/unlock", payload: { password: "correct horse battery staple" } });
+    expect(oldRes.statusCode).toBe(401);
+    const newRes = await app.inject({ method: "POST", url: "/vault/unlock", payload: { password: "new passphrase" } });
+    expect(newRes.statusCode).toBe(200);
+  });
+
+  it("won't change the password or remove a method while locked", async () => {
     await app.inject({
       method: "POST",
       url: "/vault/methods/recovery",
@@ -517,6 +532,13 @@ describe("passkey and recovery-key unlock methods", () => {
     const lockRes = await app.inject({ method: "POST", url: "/vault/lock", cookies: { [cookie.name]: cookie.value } });
     const locked = lockRes.cookies[0] ?? cookie;
 
+    const changeRes = await app.inject({
+      method: "PUT",
+      url: "/vault/methods/password",
+      cookies: { [locked.name]: locked.value },
+      payload: { newPassword: "attacker" },
+    });
+    expect(changeRes.statusCode).toBe(404);
     const deleteRes = await app.inject({ method: "DELETE", url: `/vault/methods/${recovery.id}`, cookies: { [locked.name]: locked.value } });
     expect(deleteRes.statusCode).toBe(404);
 
