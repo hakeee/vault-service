@@ -143,6 +143,11 @@ export function createSessionCache(idleTimeoutMs: number) {
       remove(sessionId);
     },
 
+    /** Locks every session of a user - e.g. when an admin disables the account or logs them out everywhere. */
+    dropUser(userId: number): void {
+      for (const [id, session] of sessions) if (session.userId === userId) remove(id);
+    },
+
     /**
      * Called whenever a session unlocks or locks (lock, logout, idle
      * timeout - an idle timeout is noticed on the next read or sweep, so

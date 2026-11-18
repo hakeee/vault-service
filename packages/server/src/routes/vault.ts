@@ -25,6 +25,7 @@ import type { AuthMode } from "../auth/mode.js";
 import { user, vaultUnlockMethod } from "../schema.js";
 import { ensureSessionId, typedSession } from "../session.js";
 import { sessionCacheInternals, type SessionCache } from "../sessionCache.js";
+import type { SelfServiceAction, SelfServiceAuthorizer } from "../accountStatus.js";
 
 const unlockBodySchema = z.object({ password: z.string().min(1) });
 const registerPasskeyBodySchema = z.object({
@@ -51,6 +52,8 @@ export interface VaultRoutesConfig {
   /** `mode: "none"` has no real identity system - this is the one implicit user's placeholder, not meant to be shown anywhere. */
   noneMode: { placeholderEmail: string; placeholderDisplayName: string };
   sessionCache: SessionCache;
+  /** May refuse self-service actions (passkeys, recovery key, passphrase change) with a 403. Default: allowed. */
+  authorize?: SelfServiceAuthorizer;
 }
 
 interface UnlockedVault {
@@ -73,6 +76,14 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
   /** Caches the session the same way for every unlock path (password, passkey, bootstrap). */
   function startSession(request: FastifyRequest, unlocked: UnlockedVault): void {
     cacheSession(ensureSessionId(typedSession(request)), unlocked.userId, unlocked.dek);
+  }
+
+  /** Replies 403 and returns false when the app's authorizer refuses `action` for this unlocked session. */
+  async function allowed(session: { userId: number }, request: FastifyRequest, reply: FastifyReply, action: SelfServiceAction) {
+    if (!config.authorize) return true;
+    const ok = await config.authorize({ userId: session.userId, sessionId: typedSession(request).get("id") ?? "" }, action);
+    if (!ok) reply.code(403).send({ error: `not allowed: ${action}` });
+    return ok;
   }
 
   /** The vault must already be unlocked to register a passkey - it wraps *this session's* DEK. */
@@ -282,6 +293,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.post("/methods/passkey/register-options", async (request, reply) => {
       const session = getSessionOrReject(request, reply);
       if (!session) return;
+      if (!(await allowed(session, request, reply, "vault:registerPasskey"))) return;
 
       const existing = await getPasskeyMethods(session.userId);
       const [userRow] = await db.select().from(user).where(eq(user.id, session.userId));
@@ -303,6 +315,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.post("/methods/passkey", async (request, reply) => {
       const session = getSessionOrReject(request, reply);
       if (!session) return;
+      if (!(await allowed(session, request, reply, "vault:registerPasskey"))) return;
 
       const { response, prfOutput, label } = registerPasskeyBodySchema.parse(request.body);
       const typed = typedSession(request);
@@ -422,6 +435,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.post("/methods/recovery", async (request, reply) => {
       const session = getSessionOrReject(request, reply);
       if (!session) return;
+      if (!(await allowed(session, request, reply, "vault:setRecoveryKey"))) return;
 
       const { recoveryKey } = recoveryKeyBodySchema.parse(request.body);
       const wrappedDek = wrapDekForRecovery(session.dek, decodeRecoveryKey(recoveryKey));
@@ -450,6 +464,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.put("/methods/password", async (request, reply) => {
       const session = getSessionOrReject(request, reply);
       if (!session) return;
+      if (!(await allowed(session, request, reply, "vault:changePassphrase"))) return;
 
       const { newPassword } = changePasswordBodySchema.parse(request.body);
       const method = await wrapDekForPassword(session.dek, newPassword);

@@ -15,6 +15,7 @@ import { user, userIdentity } from "../schema.js";
 import { typedSession, type TypedSession } from "../session.js";
 import { randomUUID } from "node:crypto";
 import type { SessionCache } from "../sessionCache.js";
+import { sessionStatus, type SelfServiceAuthorizer } from "../accountStatus.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
 const changePasswordBodySchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(8) });
@@ -53,6 +54,8 @@ export interface AuthRoutesConfig {
   signup?: "open" | "closed";
   /** Runs after every successful login, before the response - e.g. IAM role mapping. */
   onLogin?: (event: LoginEvent) => void | Promise<void>;
+  /** May refuse self-service actions (here: `auth:changePassword`) with a 403. Default: allowed. */
+  authorize?: SelfServiceAuthorizer;
 }
 
 /**
@@ -87,12 +90,21 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     if (oldId) sessionCache?.dropSession(oldId);
     session.set("id", randomUUID());
     session.set("authUserId", String(userId));
+    // Compared with the user's sessions_valid_after ("log out everywhere").
+    session.set("loginAt", String(Date.now()));
   }
+
+  /** Disabled accounts can't log in. Checked after the credentials, so it doesn't reveal which accounts exist. */
+  const isDisabled = async (userId: number) =>
+    Boolean((await db.select({ disabledAt: user.disabledAt }).from(user).where(eq(user.id, userId)))[0]?.disabledAt);
 
   return async function authRoutes(app: FastifyInstance) {
     app.get("/status", async (request) => {
-      const authUserId = typedSession(request).get("authUserId");
-      return { mode, authenticated: mode === "none" || authUserId !== undefined };
+      if (mode === "none") return { mode, authenticated: true };
+      const session = typedSession(request);
+      const status = sessionStatus(db, session);
+      if (status === "ended") session.delete();
+      return { mode, authenticated: status === "ok" };
     });
 
     app.post("/login", async (request, reply) => {
@@ -136,6 +148,10 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         return;
       }
 
+      if (await isDisabled(existingUser.id)) {
+        reply.code(403).send({ error: "account disabled" });
+        return;
+      }
       startLogin(typedSession(request), existingUser.id);
       await onLogin?.({ userId: existingUser.id, created: false, provider: "local" });
       return { status: "logged_in" };
@@ -150,6 +166,11 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const authUserId = typedSession(request).get("authUserId");
       if (authUserId === undefined) {
         reply.code(401).send({ error: "login required" });
+        return;
+      }
+      const sessionId = typedSession(request).get("id") ?? "";
+      if (config.authorize && !(await config.authorize({ userId: Number(authUserId), sessionId }, "auth:changePassword"))) {
+        reply.code(403).send({ error: "not allowed: auth:changePassword" });
         return;
       }
       const { currentPassword, newPassword } = changePasswordBodySchema.parse(request.body);
@@ -273,6 +294,10 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         authUserId = createdUser.id;
       }
 
+      if (await isDisabled(authUserId)) {
+        reply.code(403).send({ error: "account disabled" });
+        return;
+      }
       startLogin(session, authUserId);
       await onLogin?.({ userId: authUserId, created: resolution.action === "create", provider: "oidc", claims: claims.raw });
       session.set("oidcState", "");

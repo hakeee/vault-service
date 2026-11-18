@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import type { AuthMode } from "./auth/mode.js";
 import { user } from "./schema.js";
+import { sessionStatus } from "./accountStatus.js";
 import { ensureSessionId, typedSession } from "./session.js";
 
 export interface LoggedInCaller {
@@ -46,7 +47,7 @@ export function createRequireCaller(config: RequireCallerConfig) {
     }
 
     const authUserId = session.get("authUserId");
-    if (authUserId === undefined) {
+    if (authUserId === undefined || sessionStatus(config.db, session) === "ended") {
       reply.code(401).send({ error: "login required" });
       return undefined;
     }

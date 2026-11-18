@@ -143,6 +143,25 @@ login and the rest after unlock:
   password, checking the current one. It's separate from the vault
   passphrase.
 
+## Disabling accounts and ending sessions
+
+- Pass the db to `createRequireAuth(mode, { db })`. Every request then
+  checks `user.disabled_at` and `user.sessions_valid_after` against the
+  session's login time. Session cookies are stateless, so this is how
+  "disable" and "log out everywhere" take effect immediately: the cookie
+  is still valid, but the session no longer counts. `/auth/status` and
+  `createRequireCaller` check the same thing. Disabled accounts get a 403
+  "account disabled" at login, after the password check, so this doesn't
+  reveal which accounts exist.
+- `createAccountStore(db, { sessionCache })` adds `disable`, `enable`,
+  `revokeSessions` and `resetPassword` (login password only). With the
+  cache, the person's unlocked vaults lock right away too.
+- Self-service routes take an optional `authorize(caller, action)` on
+  `createAuthRoutes` and `createVaultRoutes`, for `SELF_SERVICE_ACTIONS`
+  (`vault:registerPasskey`, `vault:setRecoveryKey`, `vault:changePassphrase`,
+  `auth:changePassword`). Returning false gives a 403. Lock and logout are
+  never checked.
+
 ## Database
 
 This package owns the `user`, `user_identity` and `vault_unlock_method`

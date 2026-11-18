@@ -64,14 +64,18 @@ function createTestDb() {
   return db;
 }
 
-function buildTestApp(mode: AuthMode, authExtra: Partial<Parameters<typeof createAuthRoutes>[0]> = {}) {
+function buildTestApp(
+  mode: AuthMode,
+  authExtra: Partial<Parameters<typeof createAuthRoutes>[0]> = {},
+  vaultExtra: Partial<Parameters<typeof createVaultRoutes>[0]> = {},
+) {
   const db = createTestDb();
   const sessionCache = createSessionCache(30 * 60 * 1000);
 
   const app = Fastify();
   app.register(secureSession, { key: randomBytes(32), cookie: { path: "/" } });
 
-  const requireAuth = createRequireAuth(mode);
+  const requireAuth = createRequireAuth(mode, { db });
 
   app.register(
     createAuthRoutes({
@@ -112,12 +116,13 @@ function buildTestApp(mode: AuthMode, authExtra: Partial<Parameters<typeof creat
         webauthn: { rpID: "localhost", rpName: "Test App", origin: "http://localhost:5173" },
         noneMode: { placeholderEmail: "local@test.internal", placeholderDisplayName: "Me" },
         sessionCache,
+        ...vaultExtra,
       }),
       { prefix: "/vault" },
     );
   });
 
-  return { app, db };
+  return { app, db, sessionCache };
 }
 
 describe("mode: none - vault unlock + internal crypto service", () => {
@@ -375,6 +380,76 @@ describe("mode: single - closed signup, onLogin, accounts", () => {
     expect((await change("first-password")).statusCode).toBe(200);
     expect((await login(app, "me@example.com", "first-password")).statusCode).toBe(401);
     expect((await login(app, "me@example.com", "second-password")).statusCode).toBe(200);
+  });
+});
+
+describe("mode: single - account status and self-service rules", () => {
+  const cookieOf = (res: { cookies: { name: string; value: string }[] }, prev?: { name: string; value: string }) => res.cookies[0] ?? prev!;
+  async function loggedIn(app: ReturnType<typeof Fastify>, email: string, password = "pw") {
+    let cookie = cookieOf(await app.inject({ method: "POST", url: "/auth/login", payload: { email, password } }));
+    cookie = cookieOf(await app.inject({ method: "POST", url: "/vault/unlock", cookies: { [cookie.name]: cookie.value }, payload: { password: "pass" } }), cookie);
+    return cookie;
+  }
+  const get = (app: ReturnType<typeof Fastify>, url: string, cookie: { name: string; value: string }) =>
+    app.inject({ method: "GET", url, cookies: { [cookie.name]: cookie.value } });
+
+  it("disables an account: its sessions end, it can't log in, and enabling restores it", async () => {
+    const { app, db, sessionCache } = buildTestApp("single");
+    await app.ready();
+    await loggedIn(app, "owner@example.com");
+    const cookie = await loggedIn(app, "member@example.com");
+    const accounts = createAccountStore(db, { sessionCache });
+    const memberId = (await accounts.list()).find((a) => a.email === "member@example.com")!.id;
+
+    await accounts.disable(memberId);
+    expect((await accounts.list()).find((a) => a.id === memberId)!.disabled).toBe(true);
+    expect(sessionCache.unlockedSessions().some((s) => s.userId === memberId)).toBe(false);
+    const ended = await get(app, "/vault/status", cookie);
+    expect(ended.statusCode).toBe(401);
+    expect(ended.json()).toEqual({ error: "session ended" });
+    expect((await get(app, "/auth/status", cookie)).json()).toMatchObject({ authenticated: false });
+    const refused = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "member@example.com", password: "pw" } });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json()).toEqual({ error: "account disabled" });
+    // A wrong password still gets the generic answer, so disabled accounts don't stand out.
+    expect((await app.inject({ method: "POST", url: "/auth/login", payload: { email: "member@example.com", password: "x" } })).statusCode).toBe(401);
+
+    await accounts.enable(memberId);
+    expect((await app.inject({ method: "POST", url: "/auth/login", payload: { email: "member@example.com", password: "pw" } })).statusCode).toBe(200);
+  });
+
+  it("logs someone out everywhere, and resets their login password", async () => {
+    const { app, db, sessionCache } = buildTestApp("single");
+    await app.ready();
+    const old = await loggedIn(app, "me@example.com");
+    const accounts = createAccountStore(db, { sessionCache });
+
+    await new Promise((r) => setTimeout(r, 5)); // a login in the same millisecond as the cutoff would still count
+    await accounts.revokeSessions(1);
+    expect((await get(app, "/vault/status", old)).statusCode).toBe(401);
+    const fresh = await loggedIn(app, "me@example.com");
+    expect((await get(app, "/vault/status", fresh)).statusCode).toBe(200);
+
+    expect(await accounts.resetPassword(1, "temporary-pass")).toEqual({ ok: true });
+    expect((await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "pw" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "temporary-pass" } })).statusCode).toBe(200);
+    expect(await accounts.resetPassword(999, "x")).toEqual({ error: "no-local-login" });
+  });
+
+  it("lets the app's authorizer refuse self-service actions, and nothing else", async () => {
+    const seen: string[] = [];
+    const authorize = (_caller: unknown, action: string) => (seen.push(action), action !== "vault:setRecoveryKey" && action !== "auth:changePassword");
+    const { app } = buildTestApp("single", { authorize }, { authorize });
+    await app.ready();
+    const cookie = await loggedIn(app, "me@example.com");
+    const send = (method: "POST" | "PUT", url: string, payload: object) => app.inject({ method, url, cookies: { [cookie.name]: cookie.value }, payload });
+
+    const recovery = await send("POST", "/vault/methods/recovery", { recoveryKey: "Ab3x-K9fZ-Qp7w-Tz1m-Lk5j-Nc8h-Rv2d-Xg4y" });
+    expect(recovery.statusCode).toBe(403);
+    expect(recovery.json()).toEqual({ error: "not allowed: vault:setRecoveryKey" });
+    expect((await send("POST", "/auth/password", { currentPassword: "pw", newPassword: "longenough" })).statusCode).toBe(403);
+    expect((await send("PUT", "/vault/methods/password", { newPassword: "another" })).statusCode).toBe(200);
+    expect(seen).toEqual(["vault:setRecoveryKey", "auth:changePassword", "vault:changePassphrase"]);
   });
 });
 

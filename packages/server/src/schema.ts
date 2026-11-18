@@ -19,6 +19,10 @@ export const user = sqliteTable("user", {
   displayName: text("display_name").notNull(),
   email: text("email").notNull().unique(),
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  /** Set when an admin disables the account: no logins, existing sessions end. */
+  disabledAt: integer("disabled_at", { mode: "timestamp_ms" }),
+  /** Sessions that logged in before this are no longer valid ("log out everywhere"). */
+  sessionsValidAfter: integer("sessions_valid_after", { mode: "timestamp_ms" }),
 });
 
 export const userIdentity = sqliteTable("user_identity", {
