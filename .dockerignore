@@ -1,4 +1,8 @@
-node_modules/
-dist/
-*.tsbuildinfo
+# `**/`: this is a workspace (packages/server, packages/react). A bare
+# `dist/` only matches the top level, so the host's packages/*/dist and
+# node_modules leaked into images - a build then used whatever happened
+# to be built locally (or failed on a fresh clone).
+**/node_modules/
+**/dist/
+**/*.tsbuildinfo
 .git/
