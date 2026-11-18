@@ -13,6 +13,7 @@ import { resolveOidcAccount } from "../auth/accountResolution.js";
 import type { AuthMode } from "../auth/mode.js";
 import { user, userIdentity } from "../schema.js";
 import { typedSession } from "../session.js";
+import type { SessionCache } from "../sessionCache.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
 
@@ -22,6 +23,13 @@ export interface AuthRoutesConfig {
   oidc?: OidcConfig;
   /** Where to send the browser after a successful OIDC login (your web app's own origin). */
   postLoginRedirectUrl: string;
+  /**
+   * The same cache passed to createVaultRoutes. With it, logout also drops
+   * the session's DEK. Without it, the DEK stays in memory until the idle
+   * timeout, and a copy of the old cookie (stateless, so still valid) can
+   * still use the vault until then.
+   */
+  sessionCache?: SessionCache;
 }
 
 /**
@@ -31,7 +39,7 @@ export interface AuthRoutesConfig {
  * set).
  */
 export function createAuthRoutes(config: AuthRoutesConfig) {
-  const { db, mode, oidc, postLoginRedirectUrl } = config;
+  const { db, mode, oidc, postLoginRedirectUrl, sessionCache } = config;
 
   // Discovery hits the issuer over the network - cached for the process
   // lifetime, same idea as the DEK cache avoiding redoing expensive setup
@@ -206,7 +214,10 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     // `authUserId` was ever set there), but also drops the vault's cached
     // DEK session id, so logging out locks the vault too.
     app.post("/logout", async (request) => {
-      typedSession(request).delete();
+      const session = typedSession(request);
+      const sessionId = session.get("id");
+      if (sessionId !== undefined) sessionCache?.dropSession(sessionId);
+      session.delete();
       return { status: "logged_out" };
     });
   };

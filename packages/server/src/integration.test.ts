@@ -84,6 +84,7 @@ function buildTestApp(mode: AuthMode) {
             }
           : undefined,
       postLoginRedirectUrl: "http://localhost:5173",
+      sessionCache,
     }),
     { prefix: "/auth" },
   );
@@ -245,6 +246,29 @@ describe("mode: single - lock", () => {
       payload: { password: "vault passphrase" },
     });
     expect(relockRes.statusCode).toBe(200);
+  });
+});
+
+describe("mode: single - logout", () => {
+  it("drops the vault, so a copy of the old cookie can't use it", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "pw" } });
+    const cookie = loginRes.cookies[0]!;
+    const unlockRes = await app.inject({
+      method: "POST",
+      url: "/vault/unlock",
+      cookies: { [cookie.name]: cookie.value },
+      payload: { password: "pass" },
+    });
+    const oldCookie = unlockRes.cookies[0] ?? cookie;
+
+    await app.inject({ method: "POST", url: "/auth/logout", cookies: { [oldCookie.name]: oldCookie.value } });
+
+    // secure-session cookies are stateless: the old one still authenticates.
+    const statusRes = await app.inject({ method: "GET", url: "/vault/status", cookies: { [oldCookie.name]: oldCookie.value } });
+    expect(statusRes.statusCode).toBe(200);
+    expect(statusRes.json()).toMatchObject({ unlocked: false });
   });
 });
 
