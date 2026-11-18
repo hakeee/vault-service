@@ -6,6 +6,8 @@ export interface OidcConfig {
   clientId: string;
   clientSecret: string;
   redirectUrl: string;
+  /** Scopes to request. Default `["openid", "email"]`; add what your IdP needs to put roles or groups in the ID token. */
+  scopes?: readonly string[];
   /**
    * Decides whether a verified login is allowed to create or link an
    * account here, given the raw ID-token claims. Defaults to always-true
@@ -48,7 +50,7 @@ export async function buildAuthorizationRequest(
 
   const url = client.buildAuthorizationUrl(oidcClient, {
     redirect_uri: config.redirectUrl,
-    scope: "openid email",
+    scope: (config.scopes ?? ["openid", "email"]).join(" "),
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
     state,
