@@ -156,6 +156,12 @@ login and the rest after unlock:
 - `createAccountStore(db, { sessionCache })` adds `disable`, `enable`,
   `revokeSessions` and `resetPassword` (login password only). With the
   cache, the person's unlocked vaults lock right away too.
+- `erase(userId, { displayName? })` is GDPR erasure for a **disabled**
+  account: the `user` row stays (so the app's foreign keys and history
+  resolve) with its name and email replaced, and every login identity and
+  vault unlock method is deleted. Deleting the unlock methods destroys the
+  wrapped keys, so anything encrypted with that vault is unreadable for
+  good. The old email is free again.
 - Self-service routes take an optional `authorize(caller, action)` on
   `createAuthRoutes` and `createVaultRoutes`, for `SELF_SERVICE_ACTIONS`
   (`vault:registerPasskey`, `vault:setRecoveryKey`, `vault:changePassphrase`,

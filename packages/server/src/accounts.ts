@@ -1,7 +1,7 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, asc, eq } from "drizzle-orm";
 import { hashPassword } from "./auth/password.js";
-import { user, userIdentity } from "./schema.js";
+import { user, userIdentity, vaultUnlockMethod } from "./schema.js";
 import type { SessionCache } from "./sessionCache.js";
 
 /**
@@ -55,6 +55,30 @@ export function createAccountStore(db: BetterSQLite3Database<any>, options: { se
         .returning({ id: userIdentity.id })
         .all();
       return updated.length > 0 ? { ok: true } : { error: "no-local-login" };
+    },
+
+    /**
+     * Erasure (GDPR): the person is gone, the row stays so the app's foreign
+     * keys and history still resolve. Name and email are replaced, every login
+     * identity is removed, and every vault unlock method is deleted, which
+     * destroys the wrapped keys: data encrypted with their vault becomes
+     * unreadable for good. Only for a disabled account, as a deliberate
+     * second step after offboarding.
+     */
+    async erase(userId: number, options: { displayName?: string } = {}): Promise<{ ok: true } | { error: "not-found" | "not-disabled" }> {
+      const [row] = await db.select({ disabledAt: user.disabledAt }).from(user).where(eq(user.id, userId));
+      if (!row) return { error: "not-found" };
+      if (!row.disabledAt) return { error: "not-disabled" };
+      db.transaction((tx) => {
+        tx.delete(userIdentity).where(eq(userIdentity.userId, userId)).run();
+        tx.delete(vaultUnlockMethod).where(eq(vaultUnlockMethod.userId, userId)).run();
+        tx.update(user)
+          .set({ displayName: options.displayName ?? `Erased user #${userId}`, email: `erased-${userId}@erased.invalid`, sessionsValidAfter: new Date() })
+          .where(eq(user.id, userId))
+          .run();
+      });
+      endSessions(userId);
+      return { ok: true };
     },
 
     async create(input: { email: string; password: string; displayName: string }): Promise<{ id: number } | { error: "email-taken" }> {
