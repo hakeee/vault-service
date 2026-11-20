@@ -2,7 +2,8 @@ import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, eq } from "drizzle-orm";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { z } from "zod";
+import { z, ZodError } from "zod";
+import { createAttemptLimiter, MIN_SECRET_LENGTH } from "../attemptLimiter.js";
 import {
   createPasskeyAuthenticationChallenge,
   createPasskeyRegistrationChallenge,
@@ -38,7 +39,7 @@ const authVerifyPasskeyBodySchema = z.object({
   prfOutput: z.string().min(1), // base64url
 });
 const recoveryKeyBodySchema = z.object({ recoveryKey: z.string().min(1) });
-const changePasswordBodySchema = z.object({ newPassword: z.string().min(1) });
+const changePasswordBodySchema = z.object({ newPassword: z.string().min(MIN_SECRET_LENGTH, `choose a passphrase of at least ${MIN_SECRET_LENGTH} characters`) });
 
 /** The frontend displays the key chunked with dashes for readability - cosmetic only, stripped before decoding. */
 function decodeRecoveryKey(value: string): Buffer {
@@ -187,6 +188,10 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       .where(and(eq(vaultUnlockMethod.userId, userId), eq(vaultUnlockMethod.method, "password")));
 
     if (!methodRow) {
+      if (password.length < MIN_SECRET_LENGTH) {
+        reply.code(400).send({ error: `choose a passphrase of at least ${MIN_SECRET_LENGTH} characters` });
+        return undefined;
+      }
       return bootstrapFirstVaultForUser(userId, password);
     }
 
@@ -203,12 +208,26 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       });
       return { userId, dek };
     } catch {
+      unlockFailures.fail(String(userId));
       reply.code(401).send({ error: "wrong password" });
       return undefined;
     }
   }
 
+  // Wrong passphrases and recovery keys per account: 10 in 15 minutes, then a 429.
+  const unlockFailures = createAttemptLimiter({ max: 10, windowMs: 15 * 60_000 });
+  const tooManyUnlocks = (userId: number, reply: FastifyReply) => {
+    const wait = unlockFailures.blockedFor(String(userId));
+    if (wait > 0) reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
+    return wait > 0;
+  };
+
   return async function vaultRoutes(app: FastifyInstance) {
+    app.setErrorHandler((error, _request, reply) => {
+      if (error instanceof ZodError) return reply.code(400).send({ error: error.issues[0]?.message ?? "invalid input" });
+      return reply.send(error);
+    });
+
     app.get("/status", async (request) => {
       // `none` mode has no login to set the id, and the live socket needs
       // one before unlock; the app checks status first, so set it here.
@@ -226,10 +245,12 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.post("/unlock", async (request, reply) => {
       const { password } = unlockBodySchema.parse(request.body);
       const userId = await resolveOrCreateUserIdForUnlock(request);
+      if (tooManyUnlocks(userId, reply)) return;
 
       const unlocked = await unlockOrBootstrapVault(userId, password, reply);
       if (unlocked === undefined) return; // reply already sent (wrong password / no method)
 
+      unlockFailures.clear(String(userId));
       startSession(request, unlocked);
       return { status: "unlocked" };
     });
@@ -246,6 +267,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.post("/unlock-with-recovery", async (request, reply) => {
       const { recoveryKey } = recoveryKeyBodySchema.parse(request.body);
       const userId = await resolveOrCreateUserIdForUnlock(request);
+      if (tooManyUnlocks(userId, reply)) return;
 
       const [methodRow] = await db
         .select()
@@ -260,10 +282,12 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       try {
         dek = unlockWithRecovery(decodeRecoveryKey(recoveryKey), methodRow.wrappedDek);
       } catch {
+        unlockFailures.fail(String(userId));
         reply.code(401).send({ error: "wrong recovery key" });
         return;
       }
 
+      unlockFailures.clear(String(userId));
       startSession(request, { userId, dek });
       return { status: "unlocked" };
     });

@@ -1,7 +1,8 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
-import { z } from "zod";
+import { z, ZodError } from "zod";
+import { createAttemptLimiter, MIN_SECRET_LENGTH, type AttemptLimit } from "../attemptLimiter.js";
 import {
   buildAuthorizationRequest,
   createOidcClient,
@@ -18,7 +19,7 @@ import type { SessionCache } from "../sessionCache.js";
 import { sessionStatus, type SelfServiceAuthorizer } from "../accountStatus.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
-const changePasswordBodySchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(8) });
+const changePasswordBodySchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(MIN_SECRET_LENGTH, `at least ${MIN_SECRET_LENGTH} characters`) });
 
 /** Handed to `onLogin` after every successful login. */
 export interface LoginEvent {
@@ -56,6 +57,11 @@ export interface AuthRoutesConfig {
   onLogin?: (event: LoginEvent) => void | Promise<void>;
   /** May refuse self-service actions (here: `auth:changePassword`) with a 403. Default: allowed. */
   authorize?: SelfServiceAuthorizer;
+  /**
+   * Failed logins allowed per account and per IP within the window before a 429 (default 10 per
+   * account and 50 per IP in 15 minutes). Behind a proxy, set Fastify's `trustProxy` so the IP is the client's.
+   */
+  loginLimits?: { perAccount?: number; perIp?: number; windowMs?: number };
 }
 
 /**
@@ -66,6 +72,9 @@ export interface AuthRoutesConfig {
  */
 export function createAuthRoutes(config: AuthRoutesConfig) {
   const { db, mode, oidc, postLoginRedirectUrl, sessionCache, onLogin } = config;
+  const windowMs = config.loginLimits?.windowMs ?? 15 * 60_000;
+  const perAccount = createAttemptLimiter({ max: config.loginLimits?.perAccount ?? 10, windowMs } satisfies AttemptLimit);
+  const perIp = createAttemptLimiter({ max: config.loginLimits?.perIp ?? 50, windowMs });
   const signupOpen = async () => config.signup !== "closed" || (await db.select({ id: user.id }).from(user).limit(1)).length === 0;
 
   // Discovery hits the issuer over the network - cached for the process
@@ -99,6 +108,12 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     Boolean((await db.select({ disabledAt: user.disabledAt }).from(user).where(eq(user.id, userId)))[0]?.disabledAt);
 
   return async function authRoutes(app: FastifyInstance) {
+    // Bad input is the caller's mistake: a 400 with the first problem, not a 500.
+    app.setErrorHandler((error, _request, reply) => {
+      if (error instanceof ZodError) return reply.code(400).send({ error: error.issues[0]?.message ?? "invalid input" });
+      return reply.send(error);
+    });
+
     app.get("/status", async (request) => {
       if (mode === "none") return { mode, authenticated: true };
       const session = typedSession(request);
@@ -114,14 +129,26 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       }
 
       const { email, password } = loginBodySchema.parse(request.body);
+      const accountKey = email.toLowerCase();
+      const wait = Math.max(perAccount.blockedFor(accountKey), perIp.blockedFor(request.ip));
+      if (wait > 0) {
+        reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
+        return;
+      }
+      const failed = () => {
+        perAccount.fail(accountKey);
+        perIp.fail(request.ip);
+        reply.code(401).send({ error: "wrong email or password" });
+      };
       const [existingUser] = await db.select().from(user).where(eq(user.email, email));
 
       // First login for this email bootstraps it - mirrors routes/vault.ts's
       // "first unlock creates the vault" shape, one level up the stack.
       if (!existingUser) {
         // Same answer as a wrong password, so closed signup doesn't reveal which emails exist.
-        if (!(await signupOpen())) {
-          reply.code(401).send({ error: "wrong email or password" });
+        if (!(await signupOpen())) return failed();
+        if (password.length < MIN_SECRET_LENGTH) {
+          reply.code(400).send({ error: `choose a password of at least ${MIN_SECRET_LENGTH} characters` });
           return;
         }
         const passwordHash = await hashPassword(password);
@@ -143,10 +170,8 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         .from(userIdentity)
         .where(and(eq(userIdentity.userId, existingUser.id), eq(userIdentity.provider, "local")));
 
-      if (!identity?.passwordHash || !(await verifyPasswordHash(identity.passwordHash, password))) {
-        reply.code(401).send({ error: "wrong email or password" });
-        return;
-      }
+      if (!identity?.passwordHash || !(await verifyPasswordHash(identity.passwordHash, password))) return failed();
+      perAccount.clear(accountKey);
 
       if (await isDisabled(existingUser.id)) {
         reply.code(403).send({ error: "account disabled" });
