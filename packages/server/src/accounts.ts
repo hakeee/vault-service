@@ -1,7 +1,7 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, ne } from "drizzle-orm";
 import { hashPassword } from "./auth/password.js";
-import { user, userIdentity, vaultUnlockMethod } from "./schema.js";
+import { user, userIdentity, userMfaFactor, vaultUnlockMethod } from "./schema.js";
 import type { SessionCache } from "./sessionCache.js";
 
 /**
@@ -19,12 +19,26 @@ export function createAccountStore(db: BetterSQLite3Database<any>, options: { se
   };
 
   return {
-    async list(): Promise<{ id: number; email: string; displayName: string; disabled: boolean }[]> {
+    /** `mfa`: has an authenticator app or login passkey. */
+    async list(): Promise<{ id: number; email: string; displayName: string; disabled: boolean; mfa: boolean }[]> {
       const rows = await db
         .select({ id: user.id, email: user.email, displayName: user.displayName, disabledAt: user.disabledAt })
         .from(user)
         .orderBy(asc(user.id));
-      return rows.map(({ disabledAt, ...rest }) => ({ ...rest, disabled: disabledAt !== null }));
+      const withMfa = new Set(
+        db.select({ userId: userMfaFactor.userId }).from(userMfaFactor).where(ne(userMfaFactor.kind, "recovery")).all().map((r) => r.userId),
+      );
+      return rows.map(({ disabledAt, ...rest }) => ({ ...rest, disabled: disabledAt !== null, mfa: withMfa.has(rest.id) }));
+    },
+
+    /**
+     * Removes every second factor (lost phone, lost security key). If two-step
+     * login is required, the person sets one up again at their next login.
+     * Their sessions end too: whoever has the lost device shouldn't stay in.
+     */
+    async resetMfa(userId: number): Promise<void> {
+      db.delete(userMfaFactor).where(eq(userMfaFactor.userId, userId)).run();
+      endSessions(userId);
     },
 
     /** No logins, and current sessions end (pass `sessionCache` so unlocked vaults lock right away too). */
@@ -72,6 +86,7 @@ export function createAccountStore(db: BetterSQLite3Database<any>, options: { se
       db.transaction((tx) => {
         tx.delete(userIdentity).where(eq(userIdentity.userId, userId)).run();
         tx.delete(vaultUnlockMethod).where(eq(vaultUnlockMethod.userId, userId)).run();
+        tx.delete(userMfaFactor).where(eq(userMfaFactor.userId, userId)).run();
         tx.update(user)
           .set({ displayName: options.displayName ?? `Erased user #${userId}`, email: `erased-${userId}@erased.invalid`, sessionsValidAfter: new Date() })
           .where(eq(user.id, userId))

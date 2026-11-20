@@ -53,6 +53,7 @@ import { createVaultRoutes } from "./routes/vault.js";
 import { migrateVaultService } from "./migrate.js";
 import * as schema from "./schema.js";
 import { createSessionCache } from "./sessionCache.js";
+import { base32Decode, totpCode, totpStep } from "./auth/totp.js";
 import type { AuthMode } from "./auth/mode.js";
 
 const WORKER_SECRET = "test-worker-secret";
@@ -891,5 +892,181 @@ describe("passkey and recovery-key unlock methods", () => {
       cookies: { [unlocked.name]: unlocked.value },
     });
     expect(deleteUnlockedRes.statusCode).toBe(200);
+  });
+});
+
+describe("mode: single - two-step login (MFA)", () => {
+  const webauthn = { rpID: "localhost", rpName: "Test App", origin: "http://localhost:5173" };
+  const mfa = (required: (userId: number) => boolean) => ({ mfa: { key: randomBytes(32), issuer: "Test App", webauthn, required } });
+
+  /** One browser: keeps the session cookie between requests, like a real one. */
+  function browser(app: ReturnType<typeof buildTestApp>["app"]) {
+    let cookie: { name: string; value: string } | undefined;
+    return async (method: "GET" | "POST", url: string, payload?: unknown, remoteAddress?: string) => {
+      const res = await app.inject({ method, url, ...(payload === undefined ? {} : { payload: payload as object }), ...(cookie ? { cookies: { [cookie.name]: cookie.value } } : {}), ...(remoteAddress ? { remoteAddress } : {}) });
+      const set = res.cookies.find((c) => c.name === "session");
+      if (set) cookie = set.value ? { name: set.name, value: set.value } : undefined;
+      return res;
+    };
+  }
+  const codeFor = (secret: string, offsetSteps = 0) => totpCode(base32Decode(secret), totpStep(Date.now()) + offsetSteps);
+
+  it("forces setup when required, then asks for the code at every login; each code works once", async () => {
+    const events: { created: boolean }[] = [];
+    const { app } = buildTestApp("single", { ...mfa(() => true), onLogin: (e) => void events.push(e) });
+    await app.ready();
+    const b = browser(app);
+
+    expect((await b("POST", "/auth/login", { email: "me@example.com", password: "password1" })).json()).toEqual({ status: "mfa_setup_required" });
+    expect((await b("GET", "/auth/status")).json()).toEqual({ mode: "single", authenticated: false, mfa: "setup" });
+    // Half logged in is nobody to the rest of the app.
+    expect((await b("GET", "/whoami")).statusCode).toBe(401);
+    expect((await b("POST", "/vault/unlock", { password: "passphrase" })).statusCode).toBe(401);
+    expect(events).toEqual([]);
+
+    const { secret, uri } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    expect(uri).toContain("otpauth://totp/Test%20App%3Ame%40example.com");
+    expect((await b("POST", "/auth/mfa/totp/confirm", { code: "000000" })).statusCode).toBe(401);
+    const confirmed = await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) });
+    expect(confirmed.json().status).toBe("logged_in");
+    expect(confirmed.json().recoveryCodes).toHaveLength(10);
+    expect((await b("GET", "/whoami")).statusCode).toBe(200);
+    expect(events.map((e) => e.created)).toEqual([true]);
+
+    const next = browser(app);
+    expect((await next("POST", "/auth/login", { email: "me@example.com", password: "password1" })).json()).toEqual({ status: "mfa_required", factors: ["totp"] });
+    expect((await next("GET", "/auth/status")).json().mfa).toBe("verify");
+    // The code that confirmed the setup can't be used again.
+    expect((await next("POST", "/auth/mfa/verify/totp", { code: codeFor(secret) })).statusCode).toBe(401);
+    expect((await next("POST", "/auth/mfa/verify/totp", { code: codeFor(secret, 1) })).json()).toEqual({ status: "logged_in" });
+    expect((await next("GET", "/whoami")).statusCode).toBe(200);
+    expect(events.map((e) => e.created)).toEqual([true, false]);
+  });
+
+  it("logs in with a recovery code once per code", async () => {
+    const { app } = buildTestApp("single", mfa(() => true));
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const { secret } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    const { recoveryCodes } = (await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) })).json();
+
+    const login = async (code: string) => {
+      const c = browser(app);
+      await c("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+      return c("POST", "/auth/mfa/verify/recovery", { code });
+    };
+    const first = await login(recoveryCodes[0].toUpperCase().replace("-", " "));
+    expect(first.json()).toEqual({ status: "logged_in", recoveryCodesLeft: 9 });
+    expect((await login(recoveryCodes[0])).statusCode).toBe(401);
+  });
+
+  it("blocks after too many wrong codes, and a mid-login session expires", async () => {
+    const { app } = buildTestApp("single", mfa(() => true));
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const { secret } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) });
+
+    const c = browser(app);
+    await c("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    for (let i = 0; i < 10; i++) expect((await c("POST", "/auth/mfa/verify/totp", { code: "000000" })).statusCode).toBe(401);
+    expect((await c("POST", "/auth/mfa/verify/totp", { code: codeFor(secret, 1) })).statusCode).toBe(429);
+
+    const d = browser(app);
+    await d("POST", "/auth/login", { email: "me@example.com", password: "password1" }, "10.0.0.9");
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 11 * 60_000);
+    try {
+      expect((await d("GET", "/auth/status")).json()).toEqual({ mode: "single", authenticated: false });
+      expect((await d("POST", "/auth/mfa/verify/recovery", { code: "x" })).statusCode).toBe(401);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("ends an earlier login in the same browser when the next one stops at the second step", async () => {
+    const { app, db } = buildTestApp("single", mfa((userId) => userId === 2));
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "first@example.com", password: "password1" });
+    await createAccountStore(db).create({ email: "second@example.com", password: "password2", displayName: "Second" });
+    expect((await b("GET", "/whoami")).json().userId).toBe(1);
+    expect((await b("POST", "/auth/login", { email: "second@example.com", password: "password2" })).json().status).toBe("mfa_setup_required");
+    expect((await b("GET", "/whoami")).statusCode).toBe(401);
+  });
+
+  it("not required: logs straight in until someone sets a factor up, which then needs their password", async () => {
+    const { app, db } = buildTestApp("single", mfa(() => false));
+    await app.ready();
+    const b = browser(app);
+    expect((await b("POST", "/auth/login", { email: "me@example.com", password: "password1" })).json()).toEqual({ status: "logged_in" });
+
+    const { secret } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    expect((await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) })).statusCode).toBe(401); // no password
+    expect((await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret), password: "wrong-pass" })).statusCode).toBe(401);
+    const added = await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret), password: "password1" });
+    expect(added.json().status).toBe("added");
+    expect(added.json().recoveryCodes).toHaveLength(10);
+    expect((await createAccountStore(db).list())[0]!.mfa).toBe(true);
+
+    const status = (await b("GET", "/auth/mfa")).json();
+    expect(status.stage).toBe("full");
+    const totp = status.factors.find((f: { kind: string }) => f.kind === "totp");
+    expect((await b("POST", "/auth/mfa/remove", { id: totp.id, password: "password1" })).json()).toEqual({ status: "removed" });
+    // The recovery codes went with the last authenticator.
+    expect((await b("GET", "/auth/mfa")).json().factors).toEqual([]);
+    expect((await browser(app)("POST", "/auth/login", { email: "me@example.com", password: "password1" })).json()).toEqual({ status: "logged_in" });
+  });
+
+  it("required: the last factor can't be removed; an admin reset clears them and ends sessions", async () => {
+    const { app, db } = buildTestApp("single", mfa(() => true));
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const { secret } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) });
+    const totp = (await b("GET", "/auth/mfa")).json().factors.find((f: { kind: string }) => f.kind === "totp");
+    expect((await b("POST", "/auth/mfa/remove", { id: totp.id, password: "password1" })).statusCode).toBe(409);
+
+    await createAccountStore(db).resetMfa(1);
+    expect((await b("GET", "/whoami")).statusCode).toBe(401);
+    expect((await browser(app)("POST", "/auth/login", { email: "me@example.com", password: "password1" })).json()).toEqual({ status: "mfa_setup_required" });
+  });
+
+  it("sets up a login passkey mid-login and logs in with it", async () => {
+    const { app } = buildTestApp("single", mfa(() => true));
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    expect((await b("POST", "/auth/mfa/passkey/options")).json().options.challenge).toBeTruthy();
+    vi.mocked(verifyPasskeyRegistration).mockResolvedValueOnce({ credentialId: "cred-1", publicKey: Buffer.from("pk"), counter: 0 });
+    const registered = await b("POST", "/auth/mfa/passkey", { response: { id: "cred-1" }, label: "YubiKey" });
+    expect(registered.json().status).toBe("logged_in");
+
+    const c = browser(app);
+    expect((await c("POST", "/auth/login", { email: "me@example.com", password: "password1" })).json()).toEqual({ status: "mfa_required", factors: ["passkey"] });
+    expect((await c("POST", "/auth/mfa/verify/passkey/options")).json().options.allowCredentials).toEqual([{ id: "cred-1", type: "public-key" }]);
+    vi.mocked(verifyPasskeyAuthentication).mockResolvedValueOnce({ newCounter: 0 });
+    expect((await c("POST", "/auth/mfa/verify/passkey", { response: { id: "cred-1" } })).json()).toEqual({ status: "logged_in" });
+    expect((await c("GET", "/whoami")).statusCode).toBe(200);
+  });
+
+  it("refuses a disabled account mid-login, and erasure removes its factors", async () => {
+    const { app, db } = buildTestApp("single", mfa(() => true));
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const { secret } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) });
+
+    const c = browser(app);
+    await c("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const accounts = createAccountStore(db);
+    await accounts.disable(1);
+    expect((await c("POST", "/auth/mfa/verify/totp", { code: codeFor(secret, 1) })).statusCode).toBe(401);
+    await accounts.erase(1);
+    expect(db.select().from(schema.userMfaFactor).all()).toEqual([]);
   });
 });

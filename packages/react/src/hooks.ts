@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient, type UseMutationResult, type UseQueryResult } from "@tanstack/react-query";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/browser";
 import { registerPasskey as browserRegisterPasskey, unlockWithPasskey as browserUnlockWithPasskey } from "./browser/passkey.js";
+import { registerLoginPasskey, verifyLoginPasskey } from "./browser/loginPasskey.js";
 import { useVaultServiceClient } from "./VaultServiceProvider.js";
-import type { AuthStatus, VaultMethod, VaultStatus } from "./types.js";
+import type { AuthStatus, LoginResult, MfaEnrolled, MfaStatus, VaultMethod, VaultStatus } from "./types.js";
 
 /** The query key prefix of every hook here - invalidate it to re-check login and vault state from outside React. */
 export const vaultServiceQueryKey = ["vaultService"] as const;
@@ -26,7 +27,7 @@ export function useAuthStatus(): UseQueryResult<AuthStatus> {
   });
 }
 
-export function useLogin(): UseMutationResult<{ status: string }, Error, { email: string; password: string }> {
+export function useLogin(): UseMutationResult<LoginResult, Error, { email: string; password: string }> {
   const client = useVaultServiceClient();
   const queryClient = useQueryClient();
   return useMutation({
@@ -172,3 +173,73 @@ export function useChangePassword(): UseMutationResult<{ status: string }, Error
 // Re-exported so a consumer never needs to import @simplewebauthn/browser
 // itself just to type a passkey ceremony's response.
 export type { AuthenticationResponseJSON, RegistrationResponseJSON };
+
+// --- two-step login (MFA, `single` mode) -------------------------------------
+
+const mfaKey = ["vaultService", "mfa"] as const;
+
+/** Where the login stands and, once logged in, your second factors. */
+export function useMfaStatus(options: { enabled?: boolean } = {}): UseQueryResult<MfaStatus> {
+  const client = useVaultServiceClient();
+  return useQuery({ queryKey: mfaKey, queryFn: () => client.request<MfaStatus>("/auth/mfa"), enabled: options.enabled ?? true, retry: false });
+}
+
+/** Re-checks login state after a step that may have finished the login. */
+function useAfterMfaStep() {
+  const queryClient = useQueryClient();
+  return () => void queryClient.invalidateQueries({ queryKey: vaultServiceQueryKey });
+}
+
+/** The second step of a login: a code from the authenticator app. */
+export function useVerifyTotp(): UseMutationResult<{ status: string }, Error, string> {
+  const client = useVaultServiceClient();
+  const done = useAfterMfaStep();
+  return useMutation({ mutationFn: (code) => client.request("/auth/mfa/verify/totp", { method: "POST", body: JSON.stringify({ code }) }), onSuccess: done });
+}
+
+/** The second step with a recovery code (each works once). */
+export function useVerifyRecoveryCode(): UseMutationResult<{ status: string; recoveryCodesLeft: number }, Error, string> {
+  const client = useVaultServiceClient();
+  const done = useAfterMfaStep();
+  return useMutation({ mutationFn: (code) => client.request("/auth/mfa/verify/recovery", { method: "POST", body: JSON.stringify({ code }) }), onSuccess: done });
+}
+
+/** The second step with a login passkey (any authenticator; no PRF needed). */
+export function useVerifyLoginPasskey(): UseMutationResult<void, Error, void> {
+  const client = useVaultServiceClient();
+  const done = useAfterMfaStep();
+  return useMutation({ mutationFn: () => verifyLoginPasskey(client), onSuccess: done });
+}
+
+/** Starts adding an authenticator app: the secret and the `otpauth://` link for a QR code. */
+export function useStartTotpSetup(): UseMutationResult<{ secret: string; uri: string }, Error, void> {
+  const client = useVaultServiceClient();
+  return useMutation({ mutationFn: () => client.request("/auth/mfa/totp/setup", { method: "POST" }) });
+}
+
+/** Finishes adding an authenticator app with a code from it. Once logged in, `password` is required too. */
+export function useConfirmTotp(): UseMutationResult<MfaEnrolled, Error, { code: string; label?: string; password?: string }> {
+  const client = useVaultServiceClient();
+  const done = useAfterMfaStep();
+  return useMutation({ mutationFn: (body) => client.request("/auth/mfa/totp/confirm", { method: "POST", body: JSON.stringify(body) }), onSuccess: done });
+}
+
+/** Adds a login passkey (Bitwarden and other managers work: no PRF needed). Once logged in, `password` is required too. */
+export function useRegisterLoginPasskey(): UseMutationResult<MfaEnrolled, Error, { label?: string; password?: string }> {
+  const client = useVaultServiceClient();
+  const done = useAfterMfaStep();
+  return useMutation({ mutationFn: (body) => registerLoginPasskey(client, body), onSuccess: done });
+}
+
+/** A fresh set of recovery codes (the old ones stop working). Show them once. */
+export function useNewRecoveryCodes(): UseMutationResult<{ recoveryCodes: string[] }, Error, { password: string }> {
+  const client = useVaultServiceClient();
+  const done = useAfterMfaStep();
+  return useMutation({ mutationFn: (body) => client.request("/auth/mfa/recovery", { method: "POST", body: JSON.stringify(body) }), onSuccess: done });
+}
+
+export function useRemoveMfaFactor(): UseMutationResult<{ status: string }, Error, { id: number; password: string }> {
+  const client = useVaultServiceClient();
+  const done = useAfterMfaStep();
+  return useMutation({ mutationFn: (body) => client.request("/auth/mfa/remove", { method: "POST", body: JSON.stringify(body) }), onSuccess: done });
+}

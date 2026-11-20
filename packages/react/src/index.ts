@@ -5,4 +5,5 @@ export * from "./hooks.js";
 export * from "./useVaultGate.js";
 
 export * from "./browser/passkey.js";
+export * from "./browser/loginPasskey.js";
 export * from "./browser/recoveryKey.js";

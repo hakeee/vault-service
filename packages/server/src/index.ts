@@ -13,6 +13,8 @@ export * from "./auth/mode.js";
 export * from "./auth/password.js";
 export * from "./auth/accountResolution.js";
 export * from "./auth/oidc.js";
+export * from "./auth/totp.js";
+export * from "./auth/mfa.js";
 
 export * from "./schema.js";
 export * from "./migrate.js";
@@ -25,6 +27,7 @@ export * from "./accounts.js";
 export * from "./accountStatus.js";
 
 export * from "./routes/auth.js";
+export { type MfaConfig, type MfaStage } from "./routes/mfa.js";
 export * from "./routes/vault.js";
 export * from "./routes/internal.js";
 

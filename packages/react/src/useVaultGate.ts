@@ -1,11 +1,12 @@
 import { useAuthStatus, useVaultStatus } from "./hooks.js";
-import type { AuthMode } from "./types.js";
+import type { AuthMode, MfaStage } from "./types.js";
 
 export type VaultGateState =
   | { status: "pending" }
   /** Can't reach the server to check status at all - a PWA-style app that must work offline may want to render its main shell here anyway. */
   | { status: "offline" }
-  | { status: "login-required"; mode: AuthMode }
+  /** `mfa`: the password is done; the second step is due (or a factor must be set up first). */
+  | { status: "login-required"; mode: AuthMode; mfa?: MfaStage }
   | { status: "vault-locked"; hasVault: boolean; hasPasskey: boolean; hasRecoveryKey: boolean }
   | { status: "unlocked" };
 
@@ -27,7 +28,7 @@ export function useVaultGate(): VaultGateState {
   if (authStatus.isError) return { status: "offline" };
 
   if (authStatus.data.mode !== "none" && !authStatus.data.authenticated) {
-    return { status: "login-required", mode: authStatus.data.mode };
+    return { status: "login-required", mode: authStatus.data.mode, ...(authStatus.data.mfa ? { mfa: authStatus.data.mfa } : {}) };
   }
 
   if (vaultStatus.isPending) return { status: "pending" };

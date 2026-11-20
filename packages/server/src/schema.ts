@@ -49,3 +49,24 @@ export const vaultUnlockMethod = sqliteTable("vault_unlock_method", {
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   lastUsedAt: integer("last_used_at", { mode: "timestamp_ms" }),
 });
+
+/**
+ * Second login factors (MFA) for email + password logins, separate from
+ * vault unlock methods: login happens before the vault is open, so nothing
+ * here is wrapped with the vault. `secret` (TOTP) is encrypted with the
+ * server's MFA key; recovery codes are stored as hashes only.
+ */
+export const userMfaFactor = sqliteTable("user_mfa_factor", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull().references(() => user.id),
+  kind: text("kind", { enum: ["totp", "passkey", "recovery"] }).notNull(),
+  label: text("label"),
+  secret: blob("secret", { mode: "buffer" }), // totp only, encrypted
+  lastStep: integer("last_step"), // totp only - the last accepted time step, against replays
+  credentialId: text("credential_id"), // passkey only
+  publicKey: blob("public_key", { mode: "buffer" }), // passkey only
+  counter: integer("counter"), // passkey only
+  codes: text("codes"), // recovery only - JSON array of sha256 hex hashes of the unused codes
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  lastUsedAt: integer("last_used_at", { mode: "timestamp_ms" }),
+});

@@ -155,6 +155,44 @@ login and the rest after unlock:
   password, checking the current one. It's separate from the vault
   passphrase.
 
+## Two-step login (MFA)
+
+For `single` mode. Pass `mfa` to `createAuthRoutes`:
+`{ key, issuer, webauthn, required?, maxFailures? }`.
+
+- `key`: 32 bytes (`openssl rand -hex 32`), encrypts TOTP secrets at
+  rest. Losing it means everyone sets up their authenticator again.
+- Factors (table `user_mfa_factor`, not the vault, because login comes
+  before unlock): **authenticator apps** (TOTP, RFC 6238; each code works
+  once), **login passkeys** (WebAuthn without PRF, so password managers
+  like Bitwarden work, unlike vault passkeys) and **10 recovery codes**
+  (stored hashed, each works once). The first authenticator or passkey
+  comes with recovery codes, shown once.
+- After the password, someone with a factor (or for whom `required(userId)`
+  says yes) gets `{status: "mfa_required", factors}` or
+  `{status: "mfa_setup_required"}` instead of a login. The session is then
+  half logged in (`mfaUserId`, no `authUserId`) for 10 minutes: requireAuth
+  and the vault routes see nobody, and `/auth/status` says
+  `mfa: "verify" | "setup"`. Starting a second step ends any earlier login
+  on that session.
+- Routes under `/auth/mfa`: `GET /` (stage, required, factors),
+  `POST /verify/totp | /verify/recovery | /verify/passkey/options |
+  /verify/passkey`, `POST /totp/setup` then `/totp/confirm`,
+  `POST /passkey/options` then `/passkey`, `POST /recovery` (new codes),
+  `POST /remove`. Once fully logged in, adding, removing and new codes need
+  the login password again (`password` in the body), so a stolen cookie
+  can't change factors. The last factor can't be removed while two-step
+  login is required. Wrong codes count like wrong passwords (10 per account
+  in 15 minutes, then 429).
+- Accounts: `resetMfa(userId)` removes every factor and ends the person's
+  sessions (lost phone); `list()` says who has `mfa`; `erase` removes
+  factors too. `createMfaStore(db, key)` is exported for server-side tools.
+- React (`@hakeee/vault-service-react`): `useLogin` returns the
+  `LoginResult`; `useVaultGate` reports `login-required` with `mfa` set
+  mid-login; hooks `useMfaStatus`, `useVerifyTotp`, `useVerifyRecoveryCode`,
+  `useVerifyLoginPasskey`, `useStartTotpSetup`, `useConfirmTotp`,
+  `useRegisterLoginPasskey`, `useNewRecoveryCodes`, `useRemoveMfaFactor`.
+
 ## Disabling accounts and ending sessions
 
 - Pass the db to `createRequireAuth(mode, { db })`. Every request then

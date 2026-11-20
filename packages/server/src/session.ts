@@ -35,3 +35,9 @@ export function ensureSessionId(session: TypedSession): string {
   }
   return id;
 }
+
+/** Removes keys from the session (secure-session drops undefined values when it writes the cookie). */
+export function unsetSessionKeys(session: TypedSession, keys: readonly string[]): void {
+  const loose = session as unknown as { set(key: string, value: undefined): void };
+  for (const key of keys) loose.set(key, undefined);
+}

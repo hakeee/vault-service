@@ -13,11 +13,12 @@ import { hashPassword, verifyPasswordHash } from "../auth/password.js";
 import { resolveOidcAccount } from "../auth/accountResolution.js";
 import type { AuthMode } from "../auth/mode.js";
 import { user, userIdentity } from "../schema.js";
-import { typedSession, type TypedSession } from "../session.js";
+import { typedSession, unsetSessionKeys, type TypedSession } from "../session.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { SessionCache } from "../sessionCache.js";
 import { sessionStatus, type SelfServiceAuthorizer } from "../accountStatus.js";
 import { routeErrorHandler } from "./errors.js";
+import { createMfaRoutes, MFA_SESSION_KEYS, type MfaConfig } from "./mfa.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
 const changePasswordBodySchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(MIN_SECRET_LENGTH, `at least ${MIN_SECRET_LENGTH} characters`) });
@@ -75,6 +76,12 @@ export interface AuthRoutesConfig {
    * Behind a proxy, set Fastify's `trustProxy` so the IP is the client's.
    */
   loginLimits?: { perAccountIp?: number; perAccount?: number; perIp?: number; windowMs?: number };
+  /**
+   * Second factors for `single` mode (authenticator apps, login passkeys,
+   * recovery codes), served under `/mfa`. Without it, a correct password
+   * logs in, as before.
+   */
+  mfa?: MfaConfig;
 }
 
 /**
@@ -132,6 +139,28 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     session.set("loginAt", String(Date.now()));
   }
 
+  /** A real login: fresh session id, then the app's onLogin. */
+  async function completeLogin(session: TypedSession, userId: number, created: boolean, provider: "local" | "oidc", claims?: Record<string, unknown>) {
+    unsetSessionKeys(session, MFA_SESSION_KEYS);
+    startLogin(session, userId);
+    await onLogin?.({ userId, created, provider, ...(claims ? { claims } : {}) });
+  }
+
+  const mfa = config.mfa && mode === "single" ? createMfaRoutes({ db, config: config.mfa, completeLogin: (session, userId, created) => completeLogin(session, userId, created, "local") }) : undefined;
+
+  /** After a correct password: logged in, or on to the second step when the person has (or must have) one. */
+  async function passwordAccepted(session: TypedSession, userId: number, created: boolean) {
+    if (mfa) {
+      const kinds = mfa.store.primaryKinds(userId);
+      if (kinds.length > 0 || (await config.mfa!.required?.(userId))) {
+        mfa.begin(session, userId, kinds.length > 0 ? "verify" : "setup", created, (id) => sessionCache?.dropSession(id));
+        return kinds.length > 0 ? { status: "mfa_required", factors: kinds } : { status: "mfa_setup_required" };
+      }
+    }
+    await completeLogin(session, userId, created, "local");
+    return { status: "logged_in" };
+  }
+
   /** Disabled accounts can't log in. Checked after the credentials, so it doesn't reveal which accounts exist. */
   const isDisabled = async (userId: number) =>
     Boolean((await db.select({ disabledAt: user.disabledAt }).from(user).where(eq(user.id, userId)))[0]?.disabledAt);
@@ -139,12 +168,16 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
   return async function authRoutes(app: FastifyInstance) {
     app.setErrorHandler(routeErrorHandler);
 
+    if (mfa) await app.register(mfa.routes, { prefix: "/mfa" });
+
     app.get("/status", async (request) => {
       if (mode === "none") return { mode, authenticated: true };
       const session = typedSession(request);
       const status = sessionStatus(db, session);
       if (status === "ended") session.delete();
-      return { mode, authenticated: status === "ok" };
+      // Password done, second factor still to come (or to set up).
+      const step = status === "anonymous" ? mfa?.pending(session)?.stage : undefined;
+      return { mode, authenticated: status === "ok", ...(step ? { mfa: step } : {}) };
     });
 
     app.post("/login", async (request, reply) => {
@@ -190,9 +223,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
         await db.insert(userIdentity).values({ userId: createdUser.id, provider: "local", passwordHash });
 
-        startLogin(typedSession(request), createdUser.id);
-        await onLogin?.({ userId: createdUser.id, created: true, provider: "local" });
-        return { status: "logged_in" };
+        return passwordAccepted(typedSession(request), createdUser.id, true);
       }
 
       const [identity] = await db
@@ -212,9 +243,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         reply.code(403).send({ error: "account disabled" });
         return;
       }
-      startLogin(typedSession(request), existingUser.id);
-      await onLogin?.({ userId: existingUser.id, created: false, provider: "local" });
-      return { status: "logged_in" };
+      return passwordAccepted(typedSession(request), existingUser.id, false);
     });
 
     /** Changes the caller's own login password (single mode). Not the vault passphrase - that's `PUT /vault/methods/password`. */
@@ -361,8 +390,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         reply.code(403).send({ error: "account disabled" });
         return;
       }
-      startLogin(session, authUserId);
-      await onLogin?.({ userId: authUserId, created: resolution.action === "create", provider: "oidc", claims: claims.raw });
+      await completeLogin(session, authUserId, resolution.action === "create", "oidc", claims.raw);
       session.set("oidcState", "");
       session.set("oidcNonce", "");
       session.set("oidcCodeVerifier", "");
