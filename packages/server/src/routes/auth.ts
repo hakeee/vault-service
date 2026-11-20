@@ -1,7 +1,7 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
-import { z, ZodError } from "zod";
+import { z } from "zod";
 import { createAttemptLimiter, MIN_SECRET_LENGTH, type AttemptLimit } from "../attemptLimiter.js";
 import {
   buildAuthorizationRequest,
@@ -14,9 +14,10 @@ import { resolveOidcAccount } from "../auth/accountResolution.js";
 import type { AuthMode } from "../auth/mode.js";
 import { user, userIdentity } from "../schema.js";
 import { typedSession, type TypedSession } from "../session.js";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type { SessionCache } from "../sessionCache.js";
 import { sessionStatus, type SelfServiceAuthorizer } from "../accountStatus.js";
+import { routeErrorHandler } from "./errors.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
 const changePasswordBodySchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(MIN_SECRET_LENGTH, `at least ${MIN_SECRET_LENGTH} characters`) });
@@ -53,15 +54,27 @@ export interface AuthRoutesConfig {
    * other providers can build on `"closed"` later.
    */
   signup?: "open" | "closed";
+  /**
+   * With closed signup: the only email allowed to create the very first
+   * account (case-insensitive). OIDC logins also need the IdP to say the
+   * email is verified. Without it, whoever logs in first on an empty
+   * database becomes the owner. A single-mode login can't prove it owns
+   * the email, so keep the server private until that first account exists.
+   */
+  bootstrapEmail?: string;
   /** Runs after every successful login, before the response - e.g. IAM role mapping. */
   onLogin?: (event: LoginEvent) => void | Promise<void>;
   /** May refuse self-service actions (here: `auth:changePassword`) with a 403. Default: allowed. */
   authorize?: SelfServiceAuthorizer;
   /**
-   * Failed logins allowed per account and per IP within the window before a 429 (default 10 per
-   * account and 50 per IP in 15 minutes). Behind a proxy, set Fastify's `trustProxy` so the IP is the client's.
+   * Failed logins allowed within the window before a 429. `perAccountIp`
+   * (default 10) counts one account from one IP, so a stranger can't lock
+   * the owner out; `perAccount` (default 100) counts an account from
+   * everywhere, against guessing spread over many addresses; `perIp`
+   * (default 50) counts one address across accounts. Window: 15 minutes.
+   * Behind a proxy, set Fastify's `trustProxy` so the IP is the client's.
    */
-  loginLimits?: { perAccount?: number; perIp?: number; windowMs?: number };
+  loginLimits?: { perAccountIp?: number; perAccount?: number; perIp?: number; windowMs?: number };
 }
 
 /**
@@ -73,9 +86,25 @@ export interface AuthRoutesConfig {
 export function createAuthRoutes(config: AuthRoutesConfig) {
   const { db, mode, oidc, postLoginRedirectUrl, sessionCache, onLogin } = config;
   const windowMs = config.loginLimits?.windowMs ?? 15 * 60_000;
-  const perAccount = createAttemptLimiter({ max: config.loginLimits?.perAccount ?? 10, windowMs } satisfies AttemptLimit);
+  const perAccountIp = createAttemptLimiter({ max: config.loginLimits?.perAccountIp ?? 10, windowMs } satisfies AttemptLimit);
+  const perAccount = createAttemptLimiter({ max: config.loginLimits?.perAccount ?? 100, windowMs });
   const perIp = createAttemptLimiter({ max: config.loginLimits?.perIp ?? 50, windowMs });
-  const signupOpen = async () => config.signup !== "closed" || (await db.select({ id: user.id }).from(user).limit(1)).length === 0;
+  const bootstrapEmail = config.bootstrapEmail?.trim().toLowerCase() || undefined;
+  /** Whether a login for an unknown account may create it. `verified`: the email is known to be the person's (OIDC). */
+  const signupOpen = async (email: string | undefined, verified: boolean) => {
+    if (config.signup !== "closed") return true;
+    if ((await db.select({ id: user.id }).from(user).limit(1)).length > 0) return false;
+    return bootstrapEmail === undefined || (verified && email?.toLowerCase() === bootstrapEmail);
+  };
+
+  // Unknown accounts still get a full password check, against a hash of
+  // nothing anyone knows, so the response time doesn't reveal which emails
+  // have an account.
+  let dummyHash: Promise<string> | undefined;
+  const burnPasswordCheck = async (password: string) => {
+    dummyHash ??= hashPassword(randomBytes(32).toString("hex"));
+    await verifyPasswordHash(await dummyHash, password);
+  };
 
   // Discovery hits the issuer over the network - cached for the process
   // lifetime, same idea as the DEK cache avoiding redoing expensive setup
@@ -108,11 +137,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     Boolean((await db.select({ disabledAt: user.disabledAt }).from(user).where(eq(user.id, userId)))[0]?.disabledAt);
 
   return async function authRoutes(app: FastifyInstance) {
-    // Bad input is the caller's mistake: a 400 with the first problem, not a 500.
-    app.setErrorHandler((error, _request, reply) => {
-      if (error instanceof ZodError) return reply.code(400).send({ error: error.issues[0]?.message ?? "invalid input" });
-      return reply.send(error);
-    });
+    app.setErrorHandler(routeErrorHandler);
 
     app.get("/status", async (request) => {
       if (mode === "none") return { mode, authenticated: true };
@@ -130,12 +155,14 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
       const { email, password } = loginBodySchema.parse(request.body);
       const accountKey = email.toLowerCase();
-      const wait = Math.max(perAccount.blockedFor(accountKey), perIp.blockedFor(request.ip));
+      const pairKey = `${accountKey} ${request.ip}`;
+      const wait = Math.max(perAccountIp.blockedFor(pairKey), perAccount.blockedFor(accountKey), perIp.blockedFor(request.ip));
       if (wait > 0) {
         reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
         return;
       }
       const failed = () => {
+        perAccountIp.fail(pairKey);
         perAccount.fail(accountKey);
         perIp.fail(request.ip);
         reply.code(401).send({ error: "wrong email or password" });
@@ -145,8 +172,11 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       // First login for this email bootstraps it - mirrors routes/vault.ts's
       // "first unlock creates the vault" shape, one level up the stack.
       if (!existingUser) {
-        // Same answer as a wrong password, so closed signup doesn't reveal which emails exist.
-        if (!(await signupOpen())) return failed();
+        // Same answer and timing as a wrong password, so closed signup doesn't reveal which emails exist.
+        if (!(await signupOpen(email, true))) {
+          await burnPasswordCheck(password);
+          return failed();
+        }
         if (password.length < MIN_SECRET_LENGTH) {
           reply.code(400).send({ error: `choose a password of at least ${MIN_SECRET_LENGTH} characters` });
           return;
@@ -170,8 +200,13 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         .from(userIdentity)
         .where(and(eq(userIdentity.userId, existingUser.id), eq(userIdentity.provider, "local")));
 
-      if (!identity?.passwordHash || !(await verifyPasswordHash(identity.passwordHash, password))) return failed();
-      perAccount.clear(accountKey);
+      if (!identity?.passwordHash) {
+        await burnPasswordCheck(password);
+        return failed();
+      }
+      if (!(await verifyPasswordHash(identity.passwordHash, password))) return failed();
+      // Only this address's count: guessing from elsewhere keeps counting against the account.
+      perAccountIp.clear(pairKey);
 
       if (await isDisabled(existingUser.id)) {
         reply.code(403).send({ error: "account disabled" });
@@ -250,12 +285,15 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const oidcClient = await getOidcClient();
       const currentUrl = new URL(request.url, new URL(oidc.redirectUrl).origin);
 
-      const claims = await handleOidcCallback(oidcClient, oidc, {
-        currentUrl,
-        codeVerifier,
-        expectedState,
-        expectedNonce,
-      });
+      let claims: Awaited<ReturnType<typeof handleOidcCallback>>;
+      try {
+        claims = await handleOidcCallback(oidcClient, oidc, { currentUrl, codeVerifier, expectedState, expectedNonce });
+      } catch (error) {
+        // A stale or tampered callback, or the IdP refusing the code: the person can simply try again.
+        request.log.warn({ err: error }, "oidc callback failed");
+        reply.code(400).send({ error: "login failed; please try again" });
+        return;
+      }
 
       const [existingIdentity] = await db
         .select()
@@ -299,7 +337,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         });
         authUserId = resolution.userId;
       } else {
-        if (!(await signupOpen())) {
+        if (!(await signupOpen(claims.email, claims.emailVerified))) {
           reply.code(403).send({ error: "signup is closed - ask for an account" });
           return;
         }

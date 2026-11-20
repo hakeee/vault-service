@@ -330,6 +330,92 @@ describe("mode: single - guessing and weak secrets", () => {
     const res = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "not-an-email", password: "password1" } });
     expect(res.statusCode).toBe(400);
   });
+
+  it("blocks guessing from one address without locking the owner out elsewhere", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    const from = (remoteAddress: string, password: string) =>
+      app.inject({ method: "POST", url: "/auth/login", remoteAddress, payload: { email: "me@example.com", password } });
+    expect((await from("10.0.0.1", "password1")).statusCode).toBe(200);
+    for (let i = 0; i < 10; i++) expect((await from("10.0.0.66", "wrong-guess")).statusCode).toBe(401);
+    expect((await from("10.0.0.66", "password1")).statusCode).toBe(429);
+    expect((await from("10.0.0.1", "password1")).statusCode).toBe(200);
+  });
+
+  it("blocks an account guessed at from many addresses, everywhere, and a success elsewhere doesn't reset it", async () => {
+    const { app } = buildTestApp("single", { loginLimits: { perAccount: 5 } });
+    await app.ready();
+    const from = (remoteAddress: string, password: string) =>
+      app.inject({ method: "POST", url: "/auth/login", remoteAddress, payload: { email: "me@example.com", password } });
+    expect((await from("10.0.0.1", "password1")).statusCode).toBe(200);
+    for (let i = 0; i < 4; i++) expect((await from(`10.0.1.${i}`, "wrong-guess")).statusCode).toBe(401);
+    expect((await from("10.0.0.1", "password1")).statusCode).toBe(200);
+    expect((await from("10.0.2.1", "wrong-guess")).statusCode).toBe(401);
+    expect((await from("10.0.0.1", "password1")).statusCode).toBe(429);
+  });
+
+  it("checks a password even for unknown accounts, so timing doesn't tell them apart", async () => {
+    const { app } = buildTestApp("single", { signup: "closed" });
+    await app.ready();
+    const login = (email: string) => app.inject({ method: "POST", url: "/auth/login", payload: { email, password: "wrong-guess" } });
+    await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "password1" } });
+    await login("nobody@example.com"); // warms the dummy hash
+    const time = async (email: string) => {
+      const start = performance.now();
+      expect((await login(email)).statusCode).toBe(401);
+      return performance.now() - start;
+    };
+    const known = await time("me@example.com");
+    const unknown = await time("nobody@example.com");
+    // Both run Argon2 (tens of ms); without the dummy check the unknown one took about 1 ms.
+    expect(unknown).toBeGreaterThan(known / 3);
+  });
+
+  it("hides unexpected errors behind a bare 500", async () => {
+    const { app } = buildTestApp("single", {
+      onLogin: () => {
+        throw new Error("SQLITE_CORRUPT: secret detail");
+      },
+    });
+    await app.ready();
+    const res = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "password1" } });
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: "internal error" });
+  });
+});
+
+describe("bootstrapEmail - only the owner creates the first account", () => {
+  it("single mode: other emails can't create it, the owner's can (any case)", async () => {
+    const { app } = buildTestApp("single", { signup: "closed", bootstrapEmail: "Owner@Example.com" });
+    await app.ready();
+    const login = (email: string) => app.inject({ method: "POST", url: "/auth/login", payload: { email, password: "password1" } });
+    expect((await login("stranger@example.com")).statusCode).toBe(401);
+    expect((await login("owner@example.com")).statusCode).toBe(200);
+    expect((await login("stranger@example.com")).statusCode).toBe(401);
+  });
+
+  it("oidc: needs the owner's email, verified by the IdP", async () => {
+    const { app } = buildTestApp("oidc", { signup: "closed", bootstrapEmail: "owner@example.com" });
+    await app.ready();
+    const callback = async (subject: string, email: string, emailVerified: boolean) => {
+      vi.mocked(handleOidcCallback).mockResolvedValueOnce({ issuer: "https://idp.example.com", subject, email, emailVerified, isAuthorized: true });
+      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+      return app.inject({ method: "GET", url: "/auth/oidc/callback?code=c&state=test-state", cookies: { [cookie.name]: cookie.value } });
+    };
+    expect((await callback("s1", "stranger@example.com", true)).statusCode).toBe(403);
+    expect((await callback("s2", "owner@example.com", false)).statusCode).toBe(403);
+    expect((await callback("s3", "owner@example.com", true)).statusCode).toBe(302);
+  });
+
+  it("oidc: a failed code exchange is a 400 to retry, not a 500", async () => {
+    const { app } = buildTestApp("oidc");
+    await app.ready();
+    vi.mocked(handleOidcCallback).mockRejectedValueOnce(new Error("state mismatch: internal detail"));
+    const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+    const res = await app.inject({ method: "GET", url: "/auth/oidc/callback?code=c&state=test-state", cookies: { [cookie.name]: cookie.value } });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).not.toContain("internal detail");
+  });
 });
 
 describe("mode: single - caller without the vault", () => {

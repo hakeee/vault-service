@@ -2,7 +2,7 @@ import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, eq } from "drizzle-orm";
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { z, ZodError } from "zod";
+import { z } from "zod";
 import { createAttemptLimiter, MIN_SECRET_LENGTH } from "../attemptLimiter.js";
 import {
   createPasskeyAuthenticationChallenge,
@@ -27,6 +27,7 @@ import { user, vaultUnlockMethod } from "../schema.js";
 import { ensureSessionId, typedSession } from "../session.js";
 import { sessionCacheInternals, type SessionCache } from "../sessionCache.js";
 import type { SelfServiceAction, SelfServiceAuthorizer } from "../accountStatus.js";
+import { routeErrorHandler } from "./errors.js";
 
 const unlockBodySchema = z.object({ password: z.string().min(1) });
 const registerPasskeyBodySchema = z.object({
@@ -223,10 +224,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
   };
 
   return async function vaultRoutes(app: FastifyInstance) {
-    app.setErrorHandler((error, _request, reply) => {
-      if (error instanceof ZodError) return reply.code(400).send({ error: error.issues[0]?.message ?? "invalid input" });
-      return reply.send(error);
-    });
+    app.setErrorHandler(routeErrorHandler);
 
     app.get("/status", async (request) => {
       // `none` mode has no login to set the id, and the live socket needs

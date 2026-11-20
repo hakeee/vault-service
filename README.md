@@ -133,6 +133,18 @@ login and the rest after unlock:
   for unknown emails get the same 401 as a wrong password, and new OIDC
   identities get a 403, unless their email matches an existing account,
   in which case they're linked. Default `"open"` keeps the old behavior.
+- `bootstrapEmail` (with closed signup): on an empty database only this
+  email (any case) can create the first account; OIDC also needs the IdP's
+  `email_verified`. A single-mode login can't prove it owns the email, so
+  keep the server private until that account exists.
+- Guessing limits (`loginLimits`, 15-minute window): `perAccountIp` 10
+  failed logins for one account from one address, `perAccount` 100 from
+  everywhere, `perIp` 50 per address; then a 429 with `Retry-After`. A
+  success clears only that address's count. Unknown accounts get a dummy
+  Argon2 check, so timing doesn't reveal which emails exist.
+- Auth and vault routes answer unexpected errors with a bare
+  `{"error":"internal error"}` 500 (details in the log). A failed OIDC
+  code exchange is a 400 "login failed; please try again".
 - `createAccountStore(db)` (`list`, `create`) is for apps that create
   accounts themselves, e.g. module-host's IAM. It sets a login password
   only. The person picks their own vault passphrase on first unlock.
