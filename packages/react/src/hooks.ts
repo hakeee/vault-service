@@ -3,7 +3,7 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simp
 import { registerPasskey as browserRegisterPasskey, unlockWithPasskey as browserUnlockWithPasskey } from "./browser/passkey.js";
 import { registerLoginPasskey, verifyLoginPasskey } from "./browser/loginPasskey.js";
 import { useVaultServiceClient } from "./VaultServiceProvider.js";
-import type { AuthStatus, LoginResult, MfaEnrolled, MfaStatus, VaultMethod, VaultStatus } from "./types.js";
+import type { AuthStatus, InviteInfo, LoginResult, MfaEnrolled, MfaStatus, VaultMethod, VaultStatus } from "./types.js";
 
 /** The query key prefix of every hook here - invalidate it to re-check login and vault state from outside React. */
 export const vaultServiceQueryKey = ["vaultService"] as const;
@@ -217,29 +217,71 @@ export function useStartTotpSetup(): UseMutationResult<{ secret: string; uri: st
   return useMutation({ mutationFn: () => client.request("/auth/mfa/totp/setup", { method: "POST" }) });
 }
 
+/**
+ * After adding a factor. When recovery codes come back they must stay on
+ * screen, so login state isn't re-checked yet (that would swap the setup
+ * screen for the app): call `useRefreshVaultState()` once they're saved.
+ */
+function useAfterEnrolment() {
+  const queryClient = useQueryClient();
+  const done = useAfterMfaStep();
+  return (result: MfaEnrolled) => (result.recoveryCodes ? void queryClient.invalidateQueries({ queryKey: mfaKey }) : done());
+}
+
 /** Finishes adding an authenticator app with a code from it. Once logged in, `password` is required too. */
 export function useConfirmTotp(): UseMutationResult<MfaEnrolled, Error, { code: string; label?: string; password?: string }> {
   const client = useVaultServiceClient();
-  const done = useAfterMfaStep();
-  return useMutation({ mutationFn: (body) => client.request("/auth/mfa/totp/confirm", { method: "POST", body: JSON.stringify(body) }), onSuccess: done });
+  const enrolled = useAfterEnrolment();
+  return useMutation({ mutationFn: (body) => client.request("/auth/mfa/totp/confirm", { method: "POST", body: JSON.stringify(body) }), onSuccess: enrolled });
 }
 
 /** Adds a login passkey (Bitwarden and other managers work: no PRF needed). Once logged in, `password` is required too. */
 export function useRegisterLoginPasskey(): UseMutationResult<MfaEnrolled, Error, { label?: string; password?: string }> {
   const client = useVaultServiceClient();
-  const done = useAfterMfaStep();
-  return useMutation({ mutationFn: (body) => registerLoginPasskey(client, body), onSuccess: done });
+  const enrolled = useAfterEnrolment();
+  return useMutation({ mutationFn: (body) => registerLoginPasskey(client, body), onSuccess: enrolled });
 }
 
 /** A fresh set of recovery codes (the old ones stop working). Show them once. */
 export function useNewRecoveryCodes(): UseMutationResult<{ recoveryCodes: string[] }, Error, { password: string }> {
   const client = useVaultServiceClient();
-  const done = useAfterMfaStep();
-  return useMutation({ mutationFn: (body) => client.request("/auth/mfa/recovery", { method: "POST", body: JSON.stringify(body) }), onSuccess: done });
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body) => client.request("/auth/mfa/recovery", { method: "POST", body: JSON.stringify(body) }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: mfaKey }),
+  });
 }
 
 export function useRemoveMfaFactor(): UseMutationResult<{ status: string }, Error, { id: number; password: string }> {
   const client = useVaultServiceClient();
   const done = useAfterMfaStep();
   return useMutation({ mutationFn: (body) => client.request("/auth/mfa/remove", { method: "POST", body: JSON.stringify(body) }), onSuccess: done });
+}
+
+// --- invites -----------------------------------------------------------------
+
+/** Who an invite link is for, or a 404 `ApiError` once it expired or was used. */
+export function useInvite(token: string): UseQueryResult<InviteInfo> {
+  const client = useVaultServiceClient();
+  return useQuery({
+    queryKey: ["vaultService", "invite", token],
+    queryFn: () => client.request<InviteInfo>(`/auth/invites/${encodeURIComponent(token)}`),
+    retry: false,
+  });
+}
+
+/** Single mode: accepts the invite by choosing a login password, then continues like a login (usually on to setting up two-step login). */
+export function useAcceptInvite(token: string): UseMutationResult<LoginResult, Error, { password: string }> {
+  const client = useVaultServiceClient();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body) => client.request(`/auth/invites/${encodeURIComponent(token)}/accept`, { method: "POST", body: JSON.stringify(body) }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["vaultService", "authStatus"] }),
+  });
+}
+
+/** OIDC mode: full-page navigation that starts the IdP login tied to this invite. */
+export function useInviteStartUrl(token: string): string {
+  const client = useVaultServiceClient();
+  return `${client.baseUrl}/auth/invites/${encodeURIComponent(token)}/start`;
 }

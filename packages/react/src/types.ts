@@ -17,6 +17,25 @@ export interface AuthStatus {
 /** What `POST /auth/login` answers: logged in, or on to the second step. */
 export type LoginResult = { status: "logged_in" } | { status: "mfa_required"; factors: ("totp" | "passkey")[] } | { status: "mfa_setup_required" };
 
+/** What an invite link shows before it's accepted (`GET /auth/invites/:token`). */
+export interface InviteInfo {
+  mode: AuthMode;
+  email: string;
+  displayName: string;
+  expiresAt: string;
+}
+
+/** Why an OIDC login was refused: the `login_error` the server adds when it sends the browser back. */
+export type OidcLoginError =
+  | "failed"
+  | "not-authorized"
+  | "mfa-required"
+  | "invite-invalid"
+  | "identity-taken"
+  | "use-invite"
+  | "signup-closed"
+  | "disabled";
+
 export interface MfaFactor {
   id: number;
   kind: "totp" | "passkey" | "recovery";

@@ -189,6 +189,12 @@ login and the rest after unlock:
   accounts out (e.g. root); `false` means people only join by invite. An
   account never gets a second login at the same IdP, and an email match
   that can't be linked is refused rather than duplicated.
+- A refused login sends a browser (`Accept: text/html`) back to
+  `postLoginRedirectUrl` with `?login_error=<code>` (`OidcLoginError`:
+  `failed`, `not-authorized`, `mfa-required`, `invite-invalid`,
+  `identity-taken`, `use-invite`, `signup-closed`, `disabled`); other
+  clients get the JSON error and status. Only codes travel in the URL, so a
+  crafted link can't put words on the login screen.
 
 ## Two-step login (MFA)
 

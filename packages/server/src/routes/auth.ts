@@ -11,7 +11,7 @@ import {
   type OidcConfig,
 } from "../auth/oidc.js";
 import { hashPassword, verifyPasswordHash } from "../auth/password.js";
-import { resolveOidcAccount } from "../auth/accountResolution.js";
+import { resolveOidcAccount, type OidcLoginError } from "../auth/accountResolution.js";
 import type { AuthMode } from "../auth/mode.js";
 import { user, userIdentity } from "../schema.js";
 import { typedSession, unsetSessionKeys, type TypedSession } from "../session.js";
@@ -377,6 +377,21 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       return redirectToIdp(request, reply);
     });
 
+    /**
+     * A refused OIDC login. The browser arrives here by navigation, so it goes
+     * back to the app with a code the login screen explains
+     * (`?login_error=<code>`); API clients get the JSON error. Codes, not
+     * messages: anyone can craft that URL, so it must not carry text.
+     */
+    const refuseOidc = (request: FastifyRequest, reply: FastifyReply, status: number, code: OidcLoginError, error: string) => {
+      if (request.headers.accept?.includes("text/html")) {
+        const url = new URL(postLoginRedirectUrl);
+        url.searchParams.set("login_error", code);
+        return reply.redirect(url.toString());
+      }
+      return reply.code(status).send({ error });
+    };
+
     app.get("/oidc/callback", async (request, reply) => {
       if (mode !== "oidc" || !oidc) {
         reply.code(404).send({ error: 'auth mode is not "oidc"' });
@@ -389,8 +404,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const codeVerifier = session.get("oidcCodeVerifier");
 
       if (!expectedState || !expectedNonce || !codeVerifier) {
-        reply.code(400).send({ error: "no pending oidc login for this session" });
-        return;
+        return refuseOidc(request, reply, 400, "failed", "no pending oidc login for this session");
       }
 
       const oidcClient = await getOidcClient();
@@ -402,18 +416,17 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       } catch (error) {
         // A stale or tampered callback, or the IdP refusing the code: the person can simply try again.
         request.log.warn({ err: error }, "oidc callback failed");
-        reply.code(400).send({ error: "login failed; please try again" });
-        return;
+        return refuseOidc(request, reply, 400, "failed", "login failed; please try again");
       }
 
       // Before anything else, on every login: the IdP still lets this person in, and (if required) with a second factor.
-      if (!claims.isAuthorized) return reply.code(403).send({ error: "not authorized" });
-      if (!oidcMfaOk(claims.raw ?? {})) return reply.code(403).send({ error: "this app needs two-step login - set it up at your identity provider" });
+      if (!claims.isAuthorized) return refuseOidc(request, reply, 403, "not-authorized", "not authorized");
+      if (!oidcMfaOk(claims.raw ?? {})) return refuseOidc(request, reply, 403, "mfa-required", "this app needs two-step login - set it up at your identity provider");
 
       const inviteToken = session.get("inviteToken");
       unsetSessionKeys(session, ["inviteToken"]);
       const invite = inviteToken ? invites.find(inviteToken) : undefined;
-      if (inviteToken && !invite) return reply.code(404).send({ error: "this invite link has expired or was already used - ask for a new one" });
+      if (inviteToken && !invite) return refuseOidc(request, reply, 404, "invite-invalid", "this invite link has expired or was already used - ask for a new one");
 
       const [existingIdentity] = await db
         .select()
@@ -453,8 +466,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       });
 
       if (resolution.action === "reject") {
-        reply.code(403).send({ error: resolution.reason });
-        return;
+        return refuseOidc(request, reply, 403, resolution.code, resolution.reason);
       }
 
       let authUserId: number;
@@ -467,7 +479,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
           .from(userIdentity)
           .where(and(eq(userIdentity.userId, resolution.userId), eq(userIdentity.provider, "oidc"), eq(userIdentity.issuer, claims.issuer)))
           .get();
-        if (taken) return reply.code(409).send({ error: "this account already has a different login at this identity provider" });
+        if (taken) return refuseOidc(request, reply, 409, "identity-taken", "this account already has a different login at this identity provider");
         await db.insert(userIdentity).values({
           userId: resolution.userId,
           provider: "oidc",
@@ -477,8 +489,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         authUserId = resolution.userId;
       } else {
         if (!(await signupOpen(claims.email, claims.emailVerified))) {
-          reply.code(403).send({ error: "signup is closed - ask for an account" });
-          return;
+          return refuseOidc(request, reply, 403, "signup-closed", "signup is closed - ask for an account");
         }
         const email = claims.email ?? `${claims.subject}@${claims.issuer}`;
         const [createdUser] = await db
@@ -497,8 +508,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       }
 
       if (await isDisabled(authUserId)) {
-        reply.code(403).send({ error: "account disabled" });
-        return;
+        return refuseOidc(request, reply, 403, "disabled", "account disabled");
       }
       if (invite && invite.userId === authUserId) invites.accept(invite.id);
       await completeLogin(session, authUserId, resolution.action === "create", "oidc", claims.raw);

@@ -417,6 +417,30 @@ describe("bootstrapEmail - only the owner creates the first account", () => {
     expect(res.statusCode).toBe(400);
     expect(res.json().error).not.toContain("internal detail");
   });
+
+  it("oidc: a browser goes back to the app with an error code, not a JSON page", async () => {
+    const { app } = buildTestApp("oidc", { signup: "closed", bootstrapEmail: "owner@example.com" });
+    await app.ready();
+    const browserCallback = async () => {
+      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+      return app.inject({
+        method: "GET",
+        url: "/auth/oidc/callback?code=c&state=test-state",
+        cookies: { [cookie.name]: cookie.value },
+        headers: { accept: "text/html,application/xhtml+xml" },
+      });
+    };
+    vi.mocked(handleOidcCallback).mockResolvedValueOnce({ issuer: "https://idp.example.com", subject: "x", email: "stranger@example.com", emailVerified: true, isAuthorized: true });
+    let res = await browserCallback();
+    expect(res.statusCode).toBe(302);
+    expect(res.headers.location).toBe("http://localhost:5173/?login_error=signup-closed");
+    vi.mocked(handleOidcCallback).mockRejectedValueOnce(new Error("bad state"));
+    res = await browserCallback();
+    expect(res.headers.location).toBe("http://localhost:5173/?login_error=failed");
+    vi.mocked(handleOidcCallback).mockResolvedValueOnce({ issuer: "https://idp.example.com", subject: "y", email: "a@example.com", emailVerified: true, isAuthorized: false });
+    res = await browserCallback();
+    expect(res.headers.location).toBe("http://localhost:5173/?login_error=not-authorized");
+  });
 });
 
 describe("mode: single - caller without the vault", () => {

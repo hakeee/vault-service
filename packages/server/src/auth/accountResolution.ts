@@ -31,7 +31,18 @@ export type AccountResolution =
   | { action: "login"; userId: number }
   | { action: "link"; userId: number }
   | { action: "create" }
-  | { action: "reject"; reason: string };
+  | { action: "reject"; code: OidcLoginError; reason: string };
+
+/** Why an OIDC login was refused, as the code the app's login screen explains (`?login_error=`). */
+export type OidcLoginError =
+  | "failed"
+  | "not-authorized"
+  | "mfa-required"
+  | "invite-invalid"
+  | "identity-taken"
+  | "use-invite"
+  | "signup-closed"
+  | "disabled";
 
 /**
  * Pure decision, no I/O - the caller does the actual storage reads/writes
@@ -46,11 +57,11 @@ export type AccountResolution =
  *    rather than created twice.
  */
 export function resolveOidcAccount(claims: OidcClaims, existing: ExistingAccountLookup): AccountResolution {
-  if (!claims.isAuthorized) return { action: "reject", reason: "not authorized" };
+  if (!claims.isAuthorized) return { action: "reject", code: "not-authorized", reason: "not authorized" };
 
   if (existing.identityUserId !== undefined) {
     if (existing.invitedUserId !== undefined && existing.invitedUserId !== existing.identityUserId) {
-      return { action: "reject", reason: "this login already belongs to another account" };
+      return { action: "reject", code: "identity-taken", reason: "this login already belongs to another account" };
     }
     return { action: "login", userId: existing.identityUserId };
   }
@@ -59,7 +70,7 @@ export function resolveOidcAccount(claims: OidcClaims, existing: ExistingAccount
 
   if (existing.localUserIdByEmail !== undefined) {
     if (claims.emailVerified && existing.emailLinkAllowed !== false) return { action: "link", userId: existing.localUserIdByEmail };
-    return { action: "reject", reason: "an account with this email exists - log in with the invite link you were sent" };
+    return { action: "reject", code: "use-invite", reason: "an account with this email exists - log in with the invite link you were sent" };
   }
 
   return { action: "create" };
