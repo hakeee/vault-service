@@ -175,8 +175,14 @@ login and the rest after unlock:
   subject, so their first login matches directly. `idpInvite` asks the
   IdP to email them how to set up their sign-in. Erasure removes them at
   the IdP too (best effort, reported as `idp`). `createZitadelProvisioner
-  ({ issuerUrl, token, organizationId? })` uses ZITADEL's v2 user API with
+  ({ issuerUrl, token, organizationId?, projectId? })` uses ZITADEL's v2 user API with
   a service user's personal access token (`user.write`).
+- **Roles at the IdP**: `accounts.setIdpRoles(userId, roles)` replaces the
+  person's role keys at the IdP (`provisioner.setRoles`). ZITADEL: with
+  `projectId` (and `organizationId`, the project's owner), it creates or
+  updates their authorization on that project (AuthorizationService v2,
+  `user.grant.write` and `user.grant.read`). module-host IAM uses it so
+  roles picked in the admin UI are granted there.
 
 ## OIDC rules
 

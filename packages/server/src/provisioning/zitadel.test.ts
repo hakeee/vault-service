@@ -37,6 +37,29 @@ describe("zitadel provisioner", () => {
     expect(calls[0]!.body).toEqual({ sendCode: {} });
   });
 
+  it("grants project roles: creates the authorization, then replaces its roles", async () => {
+    const svc = "https://auth.example.cz/zitadel.authorization.v2.AuthorizationService";
+    const { impl, calls } = fakeFetch({
+      [`POST ${svc}/ListAuthorizations`]: { status: 200, body: { authorizations: [{ id: "other", user: { id: "9" }, project: { id: "p1" } }] } },
+      [`POST ${svc}/CreateAuthorization`]: { status: 200, body: { id: "a1" } },
+    });
+    const zitadel = createZitadelProvisioner({ issuerUrl: "https://auth.example.cz", token: "pat", organizationId: "org1", projectId: "p1", fetch: impl });
+    await zitadel.setRoles!("3141", ["trainer"]);
+    expect(calls.map((c) => c.url.split("/").pop())).toEqual(["ListAuthorizations", "CreateAuthorization"]);
+    expect(calls[1]!.headers["connect-protocol-version"]).toBe("1");
+    expect(calls[1]!.body).toEqual({ userId: "3141", projectId: "p1", organizationId: "org1", roleKeys: ["trainer"] });
+
+    const again = fakeFetch({
+      [`POST ${svc}/ListAuthorizations`]: { status: 200, body: { authorizations: [{ id: "a1", user: { id: "3141" }, project: { id: "p1" } }] } },
+      [`POST ${svc}/UpdateAuthorization`]: { status: 200, body: {} },
+    });
+    const z2 = createZitadelProvisioner({ issuerUrl: "https://auth.example.cz", token: "pat", organizationId: "org1", projectId: "p1", fetch: again.impl });
+    await z2.setRoles!("3141", []);
+    expect(again.calls[1]!.body).toEqual({ id: "a1", roleKeys: [] });
+
+    expect(createZitadelProvisioner({ issuerUrl: "https://auth.example.cz", token: "pat" }).setRoles).toBeUndefined();
+  });
+
   it("reports what ZITADEL said when it refuses, without the token", async () => {
     const { impl } = fakeFetch({ "POST https://auth.example.cz/v2/users/new": { status: 409, body: { message: "User already exists" } } });
     const zitadel = createZitadelProvisioner({ issuerUrl: "https://auth.example.cz", token: "secret-pat", fetch: impl });

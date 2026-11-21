@@ -7,6 +7,12 @@ export interface ZitadelProvisionerConfig {
   token: string;
   /** The organization new people go into. Default: the service user's own. */
   organizationId?: string;
+  /**
+   * The app's project: with it (and `organizationId`, which must own the
+   * project), `setRoles` grants people its roles. The service user then also
+   * needs `user.grant.write` and `user.grant.read`.
+   */
+  projectId?: string;
   /** For tests. */
   fetch?: typeof fetch;
 }
@@ -21,10 +27,10 @@ export function createZitadelProvisioner(config: ZitadelProvisionerConfig): Iden
   const base = config.issuerUrl.replace(/\/+$/, "");
   const doFetch = config.fetch ?? fetch;
 
-  async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async function call<T>(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<T> {
     const response = await doFetch(`${base}${path}`, {
       method,
-      headers: { authorization: `Bearer ${config.token}`, accept: "application/json", ...(body === undefined ? {} : { "content-type": "application/json" }) },
+      headers: { authorization: `Bearer ${config.token}`, accept: "application/json", ...(body === undefined ? {} : { "content-type": "application/json" }), ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     if (!response.ok) {
@@ -57,5 +63,27 @@ export function createZitadelProvisioner(config: ZitadelProvisionerConfig): Iden
     async removeUser(subject) {
       await call("DELETE", `/v2/users/${encodeURIComponent(subject)}`);
     },
+    ...(config.projectId ? { setRoles } : {}),
   };
+
+  /**
+   * The person's authorization ("role assignment") on the project: update it
+   * if there is one (its role list is replaced as a whole), else create it.
+   * AuthorizationService v2 speaks the Connect protocol. The list filter's
+   * JSON shape isn't in the reference, so results are also checked here.
+   */
+  async function setRoles(subject: string, roles: readonly string[]): Promise<void> {
+    const connect = <T>(method: string, body: unknown) =>
+      call<T>("POST", `/zitadel.authorization.v2.AuthorizationService/${method}`, body, { "connect-protocol-version": "1" });
+    const { authorizations = [] } = await connect<{ authorizations?: { id: string; user?: { id?: string }; project?: { id?: string } }[] }>("ListAuthorizations", {
+      filters: [{ inUserIds: { ids: [subject] } }, { projectId: { id: config.projectId } }],
+    });
+    const existing = authorizations.find((a) => a.user?.id === subject && a.project?.id === config.projectId);
+    if (existing) {
+      await connect("UpdateAuthorization", { id: existing.id, roleKeys: [...roles] });
+    } else if (roles.length > 0) {
+      if (!config.organizationId) throw new Error("zitadel: granting roles needs the organization that owns the project (organizationId)");
+      await connect("CreateAuthorization", { userId: subject, projectId: config.projectId, organizationId: config.organizationId, roleKeys: [...roles] });
+    }
+  }
 }

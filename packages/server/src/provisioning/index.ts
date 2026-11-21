@@ -13,6 +13,12 @@ export interface IdentityProvisioner {
   sendInvite(subject: string): Promise<void>;
   /** Removes the person at the IdP (account erasure). */
   removeUser(subject: string): Promise<void>;
+  /**
+   * Replaces the person's roles in the app's project at the IdP (the role
+   * keys the ID token's roles claim will carry); an empty list removes them.
+   * Optional: without it, roles are granted at the IdP by hand.
+   */
+  setRoles?(subject: string, roles: readonly string[]): Promise<void>;
 }
 
 export { createZitadelProvisioner, type ZitadelProvisionerConfig } from "./zitadel.js";

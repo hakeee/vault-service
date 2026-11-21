@@ -184,6 +184,22 @@ export function createAccountStore(db: BetterSQLite3Database<any>, options: Acco
     },
 
     /** The open invite link stops working (the account stays; disable it to keep them out entirely). */
+    /**
+     * Replaces the person's roles at the IdP (`provisioner.setRoles`): the
+     * role keys their next ID token carries. `no-idp`: they have no login at
+     * the provisioning IdP, or it can't grant roles.
+     */
+    async setIdpRoles(userId: number, roles: readonly string[]): Promise<{ ok: true } | { error: "no-idp" } | { error: "idp"; message: string }> {
+      const subject = idpSubject(userId);
+      if (!subject || !provisioner?.setRoles) return { error: "no-idp" };
+      try {
+        await provisioner.setRoles(subject, roles);
+        return { ok: true };
+      } catch (error) {
+        return { error: "idp", message: error instanceof Error ? error.message : String(error) };
+      }
+    },
+
     async revokeInvite(userId: number): Promise<void> {
       invites.revoke(userId);
     },

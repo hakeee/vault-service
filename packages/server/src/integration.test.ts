@@ -1272,6 +1272,7 @@ describe("invites and OIDC hardening", () => {
       createUser: async ({ email }: { email: string }) => (calls.push(`create ${email}`), { subject: "zit-42" }),
       sendInvite: async (subject: string) => void calls.push(`invite ${subject}`),
       removeUser: async (subject: string) => void calls.push(`remove ${subject}`),
+      setRoles: async (subject: string, roles: readonly string[]) => void calls.push(`roles ${subject} ${roles.join(",")}`),
     };
     const { app, db } = buildTestApp("oidc", { signup: "closed", linkByEmail: false });
     await app.ready();
@@ -1279,6 +1280,9 @@ describe("invites and OIDC hardening", () => {
     const invited = await accounts.invite({ email: "jana@example.com", displayName: "Jana", idpInvite: true });
     if (!("token" in invited)) throw new Error("no invite");
     expect(calls).toEqual(["create jana@example.com", "invite zit-42"]);
+    expect(await accounts.setIdpRoles(invited.id, ["trainer"])).toEqual({ ok: true });
+    expect(calls.at(-1)).toBe("roles zit-42 trainer");
+    expect(await accounts.setIdpRoles(9999, ["trainer"])).toEqual({ error: "no-idp" });
 
     const b = browser(app);
     await b("GET", "/auth/oidc/login");
