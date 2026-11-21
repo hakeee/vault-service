@@ -1,6 +1,7 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, eq } from "drizzle-orm";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { createInviteStore } from "../invites.js";
 import { z } from "zod";
 import { createAttemptLimiter, MIN_SECRET_LENGTH, type AttemptLimit } from "../attemptLimiter.js";
 import {
@@ -21,6 +22,7 @@ import { routeErrorHandler } from "./errors.js";
 import { createMfaRoutes, MFA_SESSION_KEYS, type MfaConfig } from "./mfa.js";
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
+const acceptInviteBodySchema = z.object({ password: z.string().min(MIN_SECRET_LENGTH, `choose a password of at least ${MIN_SECRET_LENGTH} characters`) });
 const changePasswordBodySchema = z.object({ currentPassword: z.string().min(1), newPassword: z.string().min(MIN_SECRET_LENGTH, `at least ${MIN_SECRET_LENGTH} characters`) });
 
 /** Handed to `onLogin` after every successful login. */
@@ -82,6 +84,23 @@ export interface AuthRoutesConfig {
    * logs in, as before.
    */
   mfa?: MfaConfig;
+  /**
+   * OIDC: whether a verified email at the IdP may link to an existing
+   * account that has no identity there yet. Default true. Give a function
+   * to keep some accounts out (the app's root), or false when people only
+   * join by invite (the production setting).
+   */
+  linkByEmail?: boolean | ((userId: number) => boolean | Promise<boolean>);
+  /**
+   * OIDC: refuse ID tokens that don't show a second factor. `true` checks
+   * that `amr` lists "mfa"; a function decides from the claims itself.
+   */
+  oidcRequireMfa?: boolean | ((claims: Record<string, unknown>) => boolean);
+}
+
+/** The default `oidcRequireMfa` check: the IdP says the login used more than one factor. */
+export function amrShowsMfa(claims: Record<string, unknown>): boolean {
+  return Array.isArray(claims.amr) && claims.amr.includes("mfa");
 }
 
 /**
@@ -92,6 +111,13 @@ export interface AuthRoutesConfig {
  */
 export function createAuthRoutes(config: AuthRoutesConfig) {
   const { db, mode, oidc, postLoginRedirectUrl, sessionCache, onLogin } = config;
+  const invites = createInviteStore(db);
+  // Invite tokens are unguessable; this only keeps someone from hammering the lookup.
+  const inviteMisses = createAttemptLimiter({ max: 20, windowMs: 15 * 60_000 });
+  const mayLinkByEmail = async (userId: number) =>
+    typeof config.linkByEmail === "function" ? await config.linkByEmail(userId) : config.linkByEmail !== false;
+  const oidcMfaOk = (claims: Record<string, unknown>) =>
+    !config.oidcRequireMfa || (typeof config.oidcRequireMfa === "function" ? config.oidcRequireMfa(claims) : amrShowsMfa(claims));
   const windowMs = config.loginLimits?.windowMs ?? 15 * 60_000;
   const perAccountIp = createAttemptLimiter({ max: config.loginLimits?.perAccountIp ?? 10, windowMs } satisfies AttemptLimit);
   const perAccount = createAttemptLimiter({ max: config.loginLimits?.perAccount ?? 100, windowMs });
@@ -275,24 +301,80 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       return { status: "changed" };
     });
 
+    /** Sends the browser to the IdP. State, nonce and PKCE verifier wait in the encrypted session cookie until the callback. */
+    async function redirectToIdp(request: FastifyRequest, reply: FastifyReply) {
+      const oidcClient = await getOidcClient();
+      const { url, state, nonce, codeVerifier } = await buildAuthorizationRequest(oidcClient, oidc!);
+      const session = typedSession(request);
+      session.set("oidcState", state);
+      session.set("oidcNonce", nonce);
+      session.set("oidcCodeVerifier", codeVerifier);
+      return reply.redirect(url);
+    }
+
     app.get("/oidc/login", async (request, reply) => {
       if (mode !== "oidc" || !oidc) {
         reply.code(404).send({ error: 'auth mode is not "oidc"' });
         return;
       }
+      // A plain login isn't an invite, even if this browser opened one earlier.
+      unsetSessionKeys(typedSession(request), ["inviteToken"]);
+      return redirectToIdp(request, reply);
+    });
 
-      const oidcClient = await getOidcClient();
-      const { url, state, nonce, codeVerifier } = await buildAuthorizationRequest(oidcClient, oidc);
+    // --- invites ---------------------------------------------------------------
 
-      // Stashed in the same secure-session cookie already used for vault
-      // unlock - no separate storage needed for a value that only needs to
-      // survive until the callback a few seconds later.
-      const session = typedSession(request);
-      session.set("oidcState", state);
-      session.set("oidcNonce", nonce);
-      session.set("oidcCodeVerifier", codeVerifier);
+    /** The open invite behind a link, counting misses per address. */
+    const openInvite = (request: FastifyRequest, reply: FastifyReply, token: string) => {
+      const wait = inviteMisses.blockedFor(request.ip);
+      if (wait > 0) {
+        reply.code(429).header("retry-after", wait).send({ error: "too many attempts; try again later" });
+        return undefined;
+      }
+      const invite = invites.find(token);
+      if (!invite) {
+        inviteMisses.fail(request.ip);
+        reply.code(404).send({ error: "this invite link has expired or was already used - ask for a new one" });
+        return undefined;
+      }
+      return invite;
+    };
 
-      reply.redirect(url);
+    /** What the invite page shows before the person acts. */
+    app.get<{ Params: { token: string } }>("/invites/:token", async (request, reply) => {
+      const invite = openInvite(request, reply, request.params.token);
+      if (!invite) return;
+      const row = db.select({ email: user.email, displayName: user.displayName, disabledAt: user.disabledAt }).from(user).where(eq(user.id, invite.userId)).get();
+      if (!row || row.disabledAt) return reply.code(404).send({ error: "this invite link has expired or was already used - ask for a new one" });
+      return { mode, email: row.email, displayName: row.displayName, expiresAt: invite.expiresAt.toISOString() };
+    });
+
+    /** Single mode: the invited person picks their login password, then goes on like any login (two-step setup when required). */
+    app.post<{ Params: { token: string } }>("/invites/:token/accept", async (request, reply) => {
+      if (mode !== "single") return reply.code(404).send({ error: 'auth mode is not "single"' });
+      const { password } = acceptInviteBodySchema.parse(request.body);
+      const invite = openInvite(request, reply, request.params.token);
+      if (!invite) return;
+      if (await isDisabled(invite.userId)) return reply.code(403).send({ error: "account disabled" });
+      const passwordHash = await hashPassword(password);
+      const updated = db
+        .update(userIdentity)
+        .set({ passwordHash })
+        .where(and(eq(userIdentity.userId, invite.userId), eq(userIdentity.provider, "local")))
+        .returning({ id: userIdentity.id })
+        .all();
+      if (updated.length === 0) db.insert(userIdentity).values({ userId: invite.userId, provider: "local", passwordHash }).run();
+      invites.accept(invite.id);
+      return passwordAccepted(typedSession(request), invite.userId, false);
+    });
+
+    /** OIDC: remembers the invite and sends the person to the IdP; the callback ties their login to the invited account. */
+    app.get<{ Params: { token: string } }>("/invites/:token/start", async (request, reply) => {
+      if (mode !== "oidc" || !oidc) return reply.code(404).send({ error: 'auth mode is not "oidc"' });
+      const invite = openInvite(request, reply, request.params.token);
+      if (!invite) return;
+      typedSession(request).set("inviteToken", request.params.token);
+      return redirectToIdp(request, reply);
     });
 
     app.get("/oidc/callback", async (request, reply) => {
@@ -324,6 +406,15 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         return;
       }
 
+      // Before anything else, on every login: the IdP still lets this person in, and (if required) with a second factor.
+      if (!claims.isAuthorized) return reply.code(403).send({ error: "not authorized" });
+      if (!oidcMfaOk(claims.raw ?? {})) return reply.code(403).send({ error: "this app needs two-step login - set it up at your identity provider" });
+
+      const inviteToken = session.get("inviteToken");
+      unsetSessionKeys(session, ["inviteToken"]);
+      const invite = inviteToken ? invites.find(inviteToken) : undefined;
+      if (inviteToken && !invite) return reply.code(404).send({ error: "this invite link has expired or was already used - ask for a new one" });
+
       const [existingIdentity] = await db
         .select()
         .from(userIdentity)
@@ -339,14 +430,26 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       // person" regardless of which provider created that row - switching
       // from a local password to OIDC keeps all data.
       let localUserIdByEmail: number | undefined;
-      if (claims.email) {
+      let emailLinkAllowed = false;
+      if (claims.email && !existingIdentity && !invite) {
         const [matchedUser] = await db.select().from(user).where(eq(user.email, claims.email));
         localUserIdByEmail = matchedUser?.id;
+        if (localUserIdByEmail !== undefined) {
+          // Never onto an account that already has a login at this IdP: that's someone else's.
+          const sameIssuer = db
+            .select({ id: userIdentity.id })
+            .from(userIdentity)
+            .where(and(eq(userIdentity.userId, localUserIdByEmail), eq(userIdentity.provider, "oidc"), eq(userIdentity.issuer, claims.issuer)))
+            .get();
+          emailLinkAllowed = !sameIssuer && (await mayLinkByEmail(localUserIdByEmail));
+        }
       }
 
       const resolution = resolveOidcAccount(claims, {
         identityUserId: existingIdentity?.userId,
+        invitedUserId: invite?.userId,
         localUserIdByEmail,
+        emailLinkAllowed,
       });
 
       if (resolution.action === "reject") {
@@ -358,6 +461,13 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       if (resolution.action === "login") {
         authUserId = resolution.userId;
       } else if (resolution.action === "link") {
+        // One login per IdP per account: an invited account already tied to another login there can't take a second.
+        const taken = db
+          .select({ id: userIdentity.id })
+          .from(userIdentity)
+          .where(and(eq(userIdentity.userId, resolution.userId), eq(userIdentity.provider, "oidc"), eq(userIdentity.issuer, claims.issuer)))
+          .get();
+        if (taken) return reply.code(409).send({ error: "this account already has a different login at this identity provider" });
         await db.insert(userIdentity).values({
           userId: resolution.userId,
           provider: "oidc",
@@ -390,6 +500,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         reply.code(403).send({ error: "account disabled" });
         return;
       }
+      if (invite && invite.userId === authUserId) invites.accept(invite.id);
       await completeLogin(session, authUserId, resolution.action === "create", "oidc", claims.raw);
       session.set("oidcState", "");
       session.set("oidcNonce", "");

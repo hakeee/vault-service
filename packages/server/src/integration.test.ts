@@ -1070,3 +1070,215 @@ describe("mode: single - two-step login (MFA)", () => {
     expect(db.select().from(schema.userMfaFactor).all()).toEqual([]);
   });
 });
+
+describe("invites and OIDC hardening", () => {
+  function browser(app: ReturnType<typeof buildTestApp>["app"]) {
+    let cookie: { name: string; value: string } | undefined;
+    return async (method: "GET" | "POST", url: string, payload?: unknown, remoteAddress?: string) => {
+      const res = await app.inject({ method, url, ...(payload === undefined ? {} : { payload: payload as object }), ...(cookie ? { cookies: { [cookie.name]: cookie.value } } : {}), ...(remoteAddress ? { remoteAddress } : {}) });
+      const set = res.cookies.find((c) => c.name === "session");
+      if (set) cookie = set.value ? { name: set.name, value: set.value } : undefined;
+      return res;
+    };
+  }
+  const idpLogin = (subject: string, email: string, extra: Partial<Parameters<typeof vi.mocked<typeof handleOidcCallback>>[0]> & { isAuthorized?: boolean; emailVerified?: boolean; raw?: Record<string, unknown> } = {}) =>
+    vi.mocked(handleOidcCallback).mockResolvedValueOnce({ issuer: "https://idp.example.com", subject, email, emailVerified: true, isAuthorized: true, raw: { sub: subject }, ...extra });
+  const callback = "/auth/oidc/callback?code=c&state=test-state";
+
+  it("single mode: the link shows who it's for, sets the password once, then works like a normal login", async () => {
+    const { app, db } = buildTestApp("single", { signup: "closed" });
+    await app.ready();
+    await browser(app)("POST", "/auth/login", { email: "owner@example.com", password: "password1" });
+    const accounts = createAccountStore(db);
+    const invited = await accounts.invite({ email: "jana@example.com", displayName: "Jana" });
+    if (!("token" in invited)) throw new Error("no invite");
+    // Invited but no password yet: logging in does nothing.
+    expect((await browser(app)("POST", "/auth/login", { email: "jana@example.com", password: "password1" })).statusCode).toBe(401);
+
+    const b = browser(app);
+    expect((await b("GET", `/auth/invites/${invited.token}`)).json()).toMatchObject({ mode: "single", email: "jana@example.com", displayName: "Jana" });
+    expect((await b("POST", `/auth/invites/${invited.token}/accept`, { password: "short" })).statusCode).toBe(400);
+    expect((await b("POST", `/auth/invites/${invited.token}/accept`, { password: "janas-password" })).json()).toEqual({ status: "logged_in" });
+    expect((await b("GET", "/whoami")).json().userId).toBe(invited.id);
+    expect((await browser(app)("GET", `/auth/invites/${invited.token}`)).statusCode).toBe(404);
+    expect((await browser(app)("POST", "/auth/login", { email: "jana@example.com", password: "janas-password" })).json()).toEqual({ status: "logged_in" });
+    expect((await accounts.list()).find((a) => a.id === invited.id)).toMatchObject({ login: true, invite: { state: "accepted" } });
+    expect(await accounts.reinvite(invited.id)).toEqual({ error: "accepted" });
+  });
+
+  it("single mode with required MFA: accepting goes on to setting up a factor", async () => {
+    const { app, db } = buildTestApp("single", { mfa: { key: randomBytes(32), issuer: "T", webauthn: { rpID: "localhost", rpName: "T", origin: "http://localhost:5173" }, required: () => true } });
+    await app.ready();
+    const invited = await createAccountStore(db).invite({ email: "jana@example.com", displayName: "Jana" });
+    if (!("token" in invited)) throw new Error("no invite");
+    const b = browser(app);
+    expect((await b("POST", `/auth/invites/${invited.token}/accept`, { password: "janas-password" })).json()).toEqual({ status: "mfa_setup_required" });
+    expect((await b("GET", "/whoami")).statusCode).toBe(401);
+  });
+
+  it("a new invite replaces the old link; revoked, expired and disabled ones don't work", async () => {
+    const { app, db } = buildTestApp("single");
+    await app.ready();
+    const accounts = createAccountStore(db);
+    const first = await accounts.invite({ email: "jana@example.com", displayName: "Jana" });
+    if (!("token" in first)) throw new Error("no invite");
+    const second = await accounts.reinvite(first.id);
+    if (!("token" in second)) throw new Error("no reinvite");
+    expect((await browser(app)("GET", `/auth/invites/${first.token}`)).statusCode).toBe(404);
+    expect((await browser(app)("GET", `/auth/invites/${second.token}`)).statusCode).toBe(200);
+
+    await accounts.revokeInvite(first.id);
+    expect((await browser(app)("GET", `/auth/invites/${second.token}`)).statusCode).toBe(404);
+    expect((await accounts.list())[0]!.invite?.state).toBe("revoked");
+
+    const third = await accounts.reinvite(first.id);
+    if (!("token" in third)) throw new Error("no reinvite");
+    await accounts.disable(first.id);
+    expect((await browser(app)("POST", `/auth/invites/${third.token}/accept`, { password: "janas-password" })).statusCode).toBe(403);
+    await accounts.enable(first.id);
+
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now + 8 * 86_400_000);
+    try {
+      expect((await browser(app)("GET", `/auth/invites/${third.token}`)).statusCode).toBe(404);
+      expect((await accounts.list())[0]!.invite?.state).toBe("expired");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("limits guessing at invite links per address", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    for (let i = 0; i < 20; i++) expect((await browser(app)("GET", `/auth/invites/nope-${i}`, undefined, "10.1.1.1")).statusCode).toBe(404);
+    expect((await browser(app)("GET", "/auth/invites/nope", undefined, "10.1.1.1")).statusCode).toBe(429);
+    expect((await browser(app)("GET", "/auth/invites/nope", undefined, "10.1.1.2")).statusCode).toBe(404);
+  });
+
+  it("oidc: an invite ties whatever login the person uses to the invited account, once", async () => {
+    const { app, db } = buildTestApp("oidc", { signup: "closed", linkByEmail: false });
+    await app.ready();
+    const accounts = createAccountStore(db);
+    const owner = browser(app);
+    await owner("GET", "/auth/oidc/login");
+    idpLogin("owner-sub", "owner@example.com");
+    expect((await owner("GET", callback)).statusCode).toBe(302);
+
+    const invited = await accounts.invite({ email: "jana@example.com", displayName: "Jana" });
+    if (!("token" in invited)) throw new Error("no invite");
+    const b = browser(app);
+    const start = await b("GET", `/auth/invites/${invited.token}/start`);
+    expect(start.statusCode).toBe(302);
+    expect(start.headers.location).toContain("idp.example.com");
+    // A different (even unverified) address at the IdP is fine: the invite is the proof.
+    idpLogin("jana-sub", "jana.private@example.org", { emailVerified: false });
+    expect((await b("GET", callback)).statusCode).toBe(302);
+    expect((await b("GET", "/whoami")).json().userId).toBe(invited.id);
+
+    const again = browser(app);
+    expect((await again("GET", `/auth/invites/${invited.token}/start`)).statusCode).toBe(404);
+    await again("GET", "/auth/oidc/login");
+    idpLogin("jana-sub", "jana.private@example.org");
+    expect((await again("GET", callback)).statusCode).toBe(302);
+    expect((await again("GET", "/whoami")).json().userId).toBe(invited.id);
+  });
+
+  it("oidc: an invite can't be taken by a login that already belongs to someone", async () => {
+    const { app, db } = buildTestApp("oidc", { signup: "closed" });
+    await app.ready();
+    const owner = browser(app);
+    await owner("GET", "/auth/oidc/login");
+    idpLogin("owner-sub", "owner@example.com");
+    await owner("GET", callback);
+    const invited = await createAccountStore(db).invite({ email: "jana@example.com", displayName: "Jana" });
+    if (!("token" in invited)) throw new Error("no invite");
+    const b = browser(app);
+    await b("GET", `/auth/invites/${invited.token}/start`);
+    idpLogin("owner-sub", "owner@example.com");
+    expect((await b("GET", callback)).statusCode).toBe(403);
+    expect((await browser(app)("GET", `/auth/invites/${invited.token}`)).statusCode).toBe(200);
+  });
+
+  it("oidc: taking the role away at the IdP locks a known person out", async () => {
+    const { app } = buildTestApp("oidc");
+    await app.ready();
+    const b = browser(app);
+    await b("GET", "/auth/oidc/login");
+    idpLogin("sub-1", "me@example.com");
+    expect((await b("GET", callback)).statusCode).toBe(302);
+    const c = browser(app);
+    await c("GET", "/auth/oidc/login");
+    idpLogin("sub-1", "me@example.com", { isAuthorized: false });
+    expect((await c("GET", callback)).statusCode).toBe(403);
+  });
+
+  it("oidc: oidcRequireMfa refuses logins whose amr shows no second factor", async () => {
+    const { app } = buildTestApp("oidc", { oidcRequireMfa: true });
+    await app.ready();
+    const b = browser(app);
+    await b("GET", "/auth/oidc/login");
+    idpLogin("sub-1", "me@example.com", { raw: { sub: "sub-1", amr: ["pwd"] } });
+    expect((await b("GET", callback)).statusCode).toBe(403);
+    await b("GET", "/auth/oidc/login");
+    idpLogin("sub-1", "me@example.com", { raw: { sub: "sub-1", amr: ["pwd", "mfa"] } });
+    expect((await b("GET", callback)).statusCode).toBe(302);
+  });
+
+  it("oidc: linking by email can be switched off, kept from some accounts, and never doubles up an IdP login", async () => {
+    const { app, db } = buildTestApp("oidc", { linkByEmail: (userId) => userId !== 1 });
+    await app.ready();
+    await createAccountStore(db).create({ email: "root@example.com", password: "password1", displayName: "Root" });
+    await createAccountStore(db).create({ email: "jana@example.com", password: "password1", displayName: "Jana" });
+    const login = async (subject: string, email: string) => {
+      const b = browser(app);
+      await b("GET", "/auth/oidc/login");
+      idpLogin(subject, email);
+      return (await b("GET", callback)).statusCode;
+    };
+    expect(await login("evil", "root@example.com")).toBe(403);
+    expect(await login("jana-1", "jana@example.com")).toBe(302);
+    // Same email, another login at the same IdP: someone else, not a second way into Jana's account.
+    expect(await login("jana-2", "jana@example.com")).toBe(403);
+  });
+
+  it("provisioning: an invited person exists at the IdP and their first login matches them directly; erasure removes them there", async () => {
+    const calls: string[] = [];
+    const provisioner = {
+      issuer: "https://idp.example.com",
+      createUser: async ({ email }: { email: string }) => (calls.push(`create ${email}`), { subject: "zit-42" }),
+      sendInvite: async (subject: string) => void calls.push(`invite ${subject}`),
+      removeUser: async (subject: string) => void calls.push(`remove ${subject}`),
+    };
+    const { app, db } = buildTestApp("oidc", { signup: "closed", linkByEmail: false });
+    await app.ready();
+    const accounts = createAccountStore(db, { provisioner });
+    const invited = await accounts.invite({ email: "jana@example.com", displayName: "Jana", idpInvite: true });
+    if (!("token" in invited)) throw new Error("no invite");
+    expect(calls).toEqual(["create jana@example.com", "invite zit-42"]);
+
+    const b = browser(app);
+    await b("GET", "/auth/oidc/login");
+    idpLogin("zit-42", "jana@example.com");
+    expect((await b("GET", callback)).statusCode).toBe(302);
+    expect((await b("GET", "/whoami")).json().userId).toBe(invited.id);
+
+    await accounts.disable(invited.id);
+    expect(await accounts.erase(invited.id)).toEqual({ ok: true, idp: "removed" });
+    expect(calls.at(-1)).toBe("remove zit-42");
+  });
+
+  it("provisioning: when the IdP refuses, no account is made here", async () => {
+    const provisioner = {
+      issuer: "https://idp.example.com",
+      createUser: async () => {
+        throw new Error("zitadel POST /v2/users/new: 409 User already exists");
+      },
+      sendInvite: async () => {},
+      removeUser: async () => {},
+    };
+    const { db } = buildTestApp("oidc");
+    const accounts = createAccountStore(db, { provisioner });
+    expect(await accounts.invite({ email: "jana@example.com", displayName: "Jana" })).toMatchObject({ error: "idp" });
+    expect(await accounts.list()).toEqual([]);
+  });
+});

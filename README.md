@@ -131,8 +131,9 @@ login and the rest after unlock:
 - `createAuthRoutes({ signup: "closed" })`: only the very first account
   signs itself up (it becomes the owner). After that, `single` mode logins
   for unknown emails get the same 401 as a wrong password, and new OIDC
-  identities get a 403, unless their email matches an existing account,
-  in which case they're linked. Default `"open"` keeps the old behavior.
+  identities get a 403, unless an invite or (when `linkByEmail` allows) a
+  verified email ties them to an existing account. Default `"open"` keeps
+  the old behavior.
 - `bootstrapEmail` (with closed signup): on an empty database only this
   email (any case) can create the first account; OIDC also needs the IdP's
   `email_verified`. A single-mode login can't prove it owns the email, so
@@ -154,6 +155,40 @@ login and the rest after unlock:
 - `POST /auth/password` (`useChangeLoginPassword`) changes your own login
   password, checking the current one. It's separate from the vault
   passphrase.
+
+## Invites
+
+- `accounts.invite({ email, displayName, idpInvite? })` makes an account
+  with no login yet and returns a one-time link `token` (7 days by
+  default, `inviteDays`; only its sha256 is stored). The app emails the
+  link. `reinvite(userId)` issues a new one (the old stops working),
+  `revokeInvite(userId)` cancels it, `list()` shows each account's
+  `invite` state (pending / expired / accepted / revoked) and `login`.
+- Routes: `GET /auth/invites/:token` (who it's for, for the invite page).
+  Single mode: `POST /auth/invites/:token/accept { password }` sets the
+  login password and continues like a login (two-step setup when
+  required). OIDC: `GET /auth/invites/:token/start` remembers the invite
+  and redirects to the IdP; the callback ties that login to the invited
+  account whatever email the IdP reports. Misses are limited per address.
+- **Provisioning** (`createAccountStore(db, { provisioner })`): inviting
+  in OIDC mode also creates the person at the IdP and stores their
+  subject, so their first login matches directly. `idpInvite` asks the
+  IdP to email them how to set up their sign-in. Erasure removes them at
+  the IdP too (best effort, reported as `idp`). `createZitadelProvisioner
+  ({ issuerUrl, token, organizationId? })` uses ZITADEL's v2 user API with
+  a service user's personal access token (`user.write`).
+
+## OIDC rules
+
+- The app's `isAuthorizedClaims` runs on **every** login, so taking the
+  role away at the IdP locks the person out here.
+- `oidcRequireMfa`: `true` refuses ID tokens whose `amr` doesn't list
+  `"mfa"` (`amrShowsMfa`); a function decides from the claims itself.
+- `linkByEmail` (default true): whether a verified email may link to an
+  existing account with no identity at that IdP. A function keeps some
+  accounts out (e.g. root); `false` means people only join by invite. An
+  account never gets a second login at the same IdP, and an email match
+  that can't be linked is refused rather than duplicated.
 
 ## Two-step login (MFA)
 

@@ -70,3 +70,19 @@ export const userMfaFactor = sqliteTable("user_mfa_factor", {
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   lastUsedAt: integer("last_used_at", { mode: "timestamp_ms" }),
 });
+
+/**
+ * Invites: an account an admin made, waiting for its person. The link's
+ * token is only stored as a sha256 hash. Single mode: the link sets the
+ * login password. OIDC: the link ties the person's IdP login to the
+ * account, so no email matching is needed.
+ */
+export const userInvite = sqliteTable("user_invite", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  userId: integer("user_id").notNull().references(() => user.id),
+  tokenHash: text("token_hash").notNull().unique(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+  expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
+  acceptedAt: integer("accepted_at", { mode: "timestamp_ms" }),
+  revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
+});
