@@ -19,9 +19,10 @@ export interface ZitadelProvisionerConfig {
 
 /**
  * ZITADEL's user API (v2). The user id it returns is the `sub` of that
- * person's ID tokens. Request shapes follow the v2 reference (CreateUser,
- * CreateInviteCode, DeleteUser); confirm them against the production
- * instance in the trial run before relying on them.
+ * person's ID tokens. CreateUser, CreateInviteCode, DeleteUser and the
+ * authorization calls below were confirmed against ZITADEL v4.20, with a
+ * service user holding only Org User Manager. The invite email links to
+ * ZITADEL's Login V2.
  */
 export function createZitadelProvisioner(config: ZitadelProvisionerConfig): IdentityProvisioner {
   const base = config.issuerUrl.replace(/\/+$/, "");
@@ -70,7 +71,8 @@ export function createZitadelProvisioner(config: ZitadelProvisionerConfig): Iden
    * The person's authorization ("role assignment") on the project: update it
    * if there is one (its role list is replaced as a whole), else create it.
    * AuthorizationService v2 speaks the Connect protocol. The list filter's
-   * JSON shape isn't in the reference, so results are also checked here.
+   * JSON shape isn't in the reference (it works on v4.20); results are
+   * checked here as well, in case a version ignores a filter.
    */
   async function setRoles(subject: string, roles: readonly string[]): Promise<void> {
     const connect = <T>(method: string, body: unknown) =>
