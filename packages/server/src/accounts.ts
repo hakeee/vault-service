@@ -92,6 +92,7 @@ export function createAccountStore(db: BetterSQLite3Database<any>, options: Acco
      * A new login password (e.g. temporary, set by an admin). Never touches
      * the vault: its passphrase can't be reset, only recovered with the
      * person's own recovery key. Accounts without a local login (OIDC) can't.
+     * Their sessions end: whoever was logged in with the old password is out.
      */
     async resetPassword(userId: number, password: string): Promise<{ ok: true } | { error: "no-local-login" }> {
       const passwordHash = await hashPassword(password);
@@ -101,7 +102,10 @@ export function createAccountStore(db: BetterSQLite3Database<any>, options: Acco
         .where(and(eq(userIdentity.userId, userId), eq(userIdentity.provider, "local")))
         .returning({ id: userIdentity.id })
         .all();
-      return updated.length > 0 ? { ok: true } : { error: "no-local-login" };
+      if (updated.length === 0) return { error: "no-local-login" };
+      // A reset password means whoever was logged in with the old one is out.
+      endSessions(userId);
+      return { ok: true };
     },
 
     /**

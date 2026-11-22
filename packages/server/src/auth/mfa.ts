@@ -1,6 +1,6 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
 import { and, asc, eq } from "drizzle-orm";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { decryptField, encryptField } from "../crypto/aes.js";
 import { userMfaFactor } from "../schema.js";
 import { base32Decode, verifyTotp } from "./totp.js";
@@ -30,15 +30,24 @@ function newRecoveryCode(): string {
 
 /** Spaces, dashes and case don't matter when typing a code back. */
 const normalizeRecoveryCode = (code: string) => code.toLowerCase().replace(/[\s-]/g, "");
-const hashRecoveryCode = (code: string) => createHash("sha256").update(normalizeRecoveryCode(code)).digest("hex");
+/**
+ * Stored recovery codes: an HMAC under the MFA key (`h1:` prefix), so a
+ * copy of the database alone can't be searched for them (50 bits is a lot
+ * to guess online, but not offline against a plain hash). Rows from before
+ * hold plain sha256 hex, and still work until they're replaced.
+ */
+const RECOVERY_HMAC = "h1:";
+const legacyRecoveryHash = (code: string) => createHash("sha256").update(normalizeRecoveryCode(code)).digest("hex");
 
 /**
  * The second factors of email + password logins. `key` (32 bytes) encrypts
- * TOTP secrets at rest, so a copy of the database alone doesn't give
- * anyone working codes.
+ * TOTP secrets and keys the recovery code hashes, so a copy of the database
+ * alone doesn't give anyone working codes.
  */
 export function createMfaStore(db: BetterSQLite3Database<any>, key: Buffer) {
   if (key.length !== 32) throw new Error("MFA key must be 32 bytes (openssl rand -hex 32)");
+  const hashRecoveryCode = (code: string) => RECOVERY_HMAC + createHmac("sha256", key).update(normalizeRecoveryCode(code)).digest("hex");
+  const sameHash = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
   const rows = (userId: number) => db.select().from(userMfaFactor).where(eq(userMfaFactor.userId, userId)).orderBy(asc(userMfaFactor.id)).all();
   const now = () => new Date();
 
@@ -102,11 +111,12 @@ export function createMfaStore(db: BetterSQLite3Database<any>, key: Buffer) {
 
     /** Uses up a recovery code: true if it was one of the unused ones. */
     useRecoveryCode(userId: number, code: string): boolean {
-      const typed = Buffer.from(hashRecoveryCode(code), "hex");
+      const typed = hashRecoveryCode(code);
+      const legacy = legacyRecoveryHash(code);
       for (const r of rows(userId)) {
         if (r.kind !== "recovery") continue;
         const hashes = JSON.parse(r.codes ?? "[]") as string[];
-        const index = hashes.findIndex((h) => timingSafeEqual(Buffer.from(h, "hex"), typed));
+        const index = hashes.findIndex((h) => sameHash(h, h.startsWith(RECOVERY_HMAC) ? typed : legacy));
         if (index === -1) continue;
         hashes.splice(index, 1);
         db.update(userMfaFactor).set({ codes: JSON.stringify(hashes), lastUsedAt: now() }).where(eq(userMfaFactor.id, r.id)).run();

@@ -4,17 +4,22 @@ import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simp
 import { generateAuthenticationOptions, generateRegistrationOptions } from "@simplewebauthn/server";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { createAttemptLimiter } from "../attemptLimiter.js";
+import { createAttemptLimiter, type AttemptLimiter } from "../attemptLimiter.js";
 import { sessionStatus } from "../accountStatus.js";
+import type { DeviceCookies } from "../auth/device.js";
 import { createMfaStore, type MfaStore } from "../auth/mfa.js";
 import { verifyPasswordHash } from "../auth/password.js";
 import { generateTotpSecret, totpUri, verifyTotp, base32Decode } from "../auth/totp.js";
 import { verifyPasskeyAuthentication, verifyPasskeyRegistration, type WebauthnConfig } from "../crypto/webauthn.js";
 import { user, userIdentity } from "../schema.js";
+import type { SecurityEvent } from "../securityEvents.js";
 import { typedSession, unsetSessionKeys, type TypedSession } from "../session.js";
 
 export interface MfaConfig {
-  /** 32 bytes (`openssl rand -hex 32`): encrypts TOTP secrets at rest. Losing it means everyone sets up their authenticator again. */
+  /**
+   * 32 bytes (`openssl rand -hex 32`): encrypts TOTP secrets and keys recovery code hashes at rest.
+   * Losing it means everyone sets up their authenticator again.
+   */
   key: Buffer;
   /** The name authenticator apps show next to the account. */
   issuer: string;
@@ -26,7 +31,10 @@ export interface MfaConfig {
    * they have none yet, the login stops at setting one up.
    */
   required?: (userId: number) => boolean | Promise<boolean>;
-  /** Wrong codes (and wrong passwords on these routes) per account before a 429. Default 10 in 15 minutes. */
+  /**
+   * Wrong codes per account and browser before a 429. Default 10; the first
+   * block lasts 15 minutes, each next one twice as long (up to a day).
+   */
   maxFailures?: number;
 }
 
@@ -52,8 +60,13 @@ type Caller = { userId: number; stage: MfaStage | "full"; created: boolean };
 export interface MfaRoutesDeps {
   db: BetterSQLite3Database<any>;
   config: MfaConfig;
-  /** Finishes the login (fresh session id, `authUserId`, onLogin) once the second factor is in. */
-  completeLogin: (session: TypedSession, userId: number, created: boolean) => Promise<void>;
+  /** Finishes the login (fresh session id, `authUserId`, known-device cookie, onLogin) once the second factor is in. */
+  completeLogin: (request: FastifyRequest, reply: FastifyReply, userId: number, created: boolean) => Promise<void>;
+  /** Known browsers: wrong codes from one don't block the owner's others. */
+  devices: DeviceCookies;
+  /** Wrong passwords on a logged-in session, per account: shared with changing the password, so a stolen cookie can't guess it. */
+  reauthFailures: AttemptLimiter;
+  notify: (event: SecurityEvent) => void;
 }
 
 /**
@@ -64,9 +77,10 @@ export interface MfaRoutesDeps {
  * then `completeLogin` makes it a real login.
  */
 export function createMfaRoutes(deps: MfaRoutesDeps) {
-  const { db, config } = deps;
+  const { db, config, devices, reauthFailures, notify } = deps;
   const store: MfaStore = createMfaStore(db, config.key);
-  const failures = createAttemptLimiter({ max: config.maxFailures ?? 10, windowMs: 15 * 60_000 });
+  // Escalating: 10 tries per 15 minutes would still add up to a fair chance at a 6-digit code over months.
+  const failures = createAttemptLimiter({ max: config.maxFailures ?? 10, windowMs: 15 * 60_000, escalate: { maxBlockMs: 24 * 60 * 60_000 } });
 
   /** Puts the session in the second-factor step: any earlier login on it ends here. */
   function begin(session: TypedSession, userId: number, stage: MfaStage, created: boolean, dropSession: (id: string) => void): void {
@@ -106,26 +120,35 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
     return found;
   }
 
-  const blocked = (userId: number, reply: FastifyReply) => {
-    const wait = failures.blockedFor(String(userId));
+  /** Wrong codes count per account and browser: a known browser of the owner has its own count. */
+  const codeKey = (request: FastifyRequest, userId: number) => `${userId}:${devices.read(request, userId) ?? "-"}`;
+  const tooMany = (limiter: AttemptLimiter, key: string, reply: FastifyReply) => {
+    const wait = limiter.blockedFor(key);
     if (wait > 0) reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
     return wait > 0;
   };
-  const failed = (userId: number, reply: FastifyReply, error: string) => {
-    failures.fail(String(userId));
+  const codeBlocked = (request: FastifyRequest, who: Caller, reply: FastifyReply) => tooMany(failures, codeKey(request, who.userId), reply);
+  const codeFailed = (request: FastifyRequest, who: Caller, reply: FastifyReply, error: string) => {
+    if (failures.fail(codeKey(request, who.userId))) notify({ userId: who.userId, kind: "mfa-blocked" });
     reply.code(401).send({ error });
+  };
+  const loggedIn = async (request: FastifyRequest, reply: FastifyReply, who: Caller) => {
+    failures.clear(codeKey(request, who.userId));
+    await deps.completeLogin(request, reply, who.userId, who.created);
   };
 
   /** Fully logged-in sessions re-type the password before changing factors; mid-login ones just did. */
   async function passwordOk(who: Caller, given: string | undefined, reply: FastifyReply): Promise<boolean> {
     if (who.stage !== "full") return true;
+    if (tooMany(reauthFailures, String(who.userId), reply)) return false;
     const identity = db
       .select({ hash: userIdentity.passwordHash })
       .from(userIdentity)
       .where(and(eq(userIdentity.userId, who.userId), eq(userIdentity.provider, "local")))
       .get();
     if (!identity?.hash || !given || !(await verifyPasswordHash(identity.hash, given))) {
-      failed(who.userId, reply, "wrong password");
+      reauthFailures.fail(String(who.userId));
+      reply.code(401).send({ error: "wrong password" });
       return false;
     }
     return true;
@@ -134,12 +157,13 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
   const isRequired = async (userId: number) => (await config.required?.(userId)) ?? false;
 
   /** After a new authenticator or passkey: recovery codes the first time, and the login finishes if it was waiting on setup. */
-  async function enrolled(request: FastifyRequest, who: Caller) {
+  async function enrolled(request: FastifyRequest, reply: FastifyReply, who: Caller, factor: "totp" | "passkey") {
     const firstFactor = !store.list(who.userId).some((f) => f.kind === "recovery");
     const recoveryCodes = firstFactor ? store.newRecoveryCodes(who.userId) : undefined;
     const session = typedSession(request);
     unsetSessionKeys(session, ["mfaTotpSecret", "mfaChallenge"]);
-    if (who.stage === "setup") await deps.completeLogin(session, who.userId, who.created);
+    if (who.stage === "setup") await deps.completeLogin(request, reply, who.userId, who.created);
+    notify({ userId: who.userId, kind: "factor-added", factor });
     return { status: who.stage === "setup" ? "logged_in" : "added", ...(recoveryCodes ? { recoveryCodes } : {}) };
   }
 
@@ -162,21 +186,19 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
 
     app.post("/verify/totp", async (request, reply) => {
       const who = caller(request, reply, ["verify"]);
-      if (!who || blocked(who.userId, reply)) return;
+      if (!who || codeBlocked(request, who, reply)) return;
       const { code } = codeBody.parse(request.body);
-      if (!store.verifyTotp(who.userId, code)) return failed(who.userId, reply, "wrong code");
-      failures.clear(String(who.userId));
-      await deps.completeLogin(typedSession(request), who.userId, who.created);
+      if (!store.verifyTotp(who.userId, code)) return codeFailed(request, who, reply, "wrong code");
+      await loggedIn(request, reply, who);
       return { status: "logged_in" };
     });
 
     app.post("/verify/recovery", async (request, reply) => {
       const who = caller(request, reply, ["verify"]);
-      if (!who || blocked(who.userId, reply)) return;
+      if (!who || codeBlocked(request, who, reply)) return;
       const { code } = codeBody.parse(request.body);
-      if (!store.useRecoveryCode(who.userId, code)) return failed(who.userId, reply, "wrong code");
-      failures.clear(String(who.userId));
-      await deps.completeLogin(typedSession(request), who.userId, who.created);
+      if (!store.useRecoveryCode(who.userId, code)) return codeFailed(request, who, reply, "wrong code");
+      await loggedIn(request, reply, who);
       const left = store.list(who.userId).find((f) => f.kind === "recovery")?.remaining ?? 0;
       return { status: "logged_in", recoveryCodesLeft: left };
     });
@@ -197,12 +219,12 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
 
     app.post("/verify/passkey", async (request, reply) => {
       const who = caller(request, reply, ["verify"]);
-      if (!who || blocked(who.userId, reply)) return;
+      if (!who || codeBlocked(request, who, reply)) return;
       const { response } = passkeyVerifyBody.parse(request.body);
       const session = typedSession(request);
       const challenge = session.get("mfaChallenge");
       const passkey = store.passkeys(who.userId).find((p) => p.credentialId === response?.id);
-      if (!challenge || !passkey) return failed(who.userId, reply, "passkey verification failed");
+      if (!challenge || !passkey) return codeFailed(request, who, reply, "passkey verification failed");
       let newCounter: number;
       try {
         ({ newCounter } = await verifyPasskeyAuthentication(config.webauthn, response, challenge, {
@@ -211,13 +233,12 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
           counter: passkey.counter,
         }));
       } catch {
-        return failed(who.userId, reply, "passkey verification failed");
+        return codeFailed(request, who, reply, "passkey verification failed");
       }
       // A counter that didn't go up means a cloned authenticator, except 0 -> 0 (synced passkeys don't count).
-      if (!(newCounter > passkey.counter || (newCounter === 0 && passkey.counter === 0))) return failed(who.userId, reply, "passkey verification failed");
+      if (!(newCounter > passkey.counter || (newCounter === 0 && passkey.counter === 0))) return codeFailed(request, who, reply, "passkey verification failed");
       store.passkeyUsed(passkey.id, newCounter);
-      failures.clear(String(who.userId));
-      await deps.completeLogin(session, who.userId, who.created);
+      await loggedIn(request, reply, who);
       return { status: "logged_in" };
     });
 
@@ -235,15 +256,15 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
 
     app.post("/totp/confirm", async (request, reply) => {
       const who = caller(request, reply, ["setup", "full"]);
-      if (!who || blocked(who.userId, reply)) return;
+      if (!who || codeBlocked(request, who, reply)) return;
       const body = totpConfirmBody.parse(request.body);
       if (!(await passwordOk(who, body.password, reply))) return;
       const secret = typedSession(request).get("mfaTotpSecret");
       if (!secret) return reply.code(409).send({ error: "start the setup first" });
       const step = verifyTotp(base32Decode(secret), body.code, Date.now());
-      if (step === null) return failed(who.userId, reply, "wrong code; check the time on your phone");
+      if (step === null) return codeFailed(request, who, reply, "wrong code; check the time on your phone");
       store.addTotp(who.userId, secret, body.label || "Authenticator app", step);
-      return enrolled(request, who);
+      return enrolled(request, reply, who, "totp");
     });
 
     app.post("/passkey/options", async (request, reply) => {
@@ -264,7 +285,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
 
     app.post("/passkey", async (request, reply) => {
       const who = caller(request, reply, ["setup", "full"]);
-      if (!who || blocked(who.userId, reply)) return;
+      if (!who) return;
       const body = passkeyRegisterBody.parse(request.body);
       if (!(await passwordOk(who, body.password, reply))) return;
       const challenge = typedSession(request).get("mfaChallenge");
@@ -276,21 +297,23 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
         return reply.code(400).send({ error: "passkey registration could not be verified" });
       }
       store.addPasskey(who.userId, credential, body.label || "Passkey");
-      return enrolled(request, who);
+      return enrolled(request, reply, who, "passkey");
     });
 
     app.post("/recovery", async (request, reply) => {
       const who = caller(request, reply, ["full"]);
-      if (!who || blocked(who.userId, reply)) return;
+      if (!who) return;
       const body = passwordBody.parse(request.body);
       if (!(await passwordOk(who, body.password, reply))) return;
       if (store.primaryKinds(who.userId).length === 0) return reply.code(409).send({ error: "set up an authenticator app or passkey first" });
-      return { recoveryCodes: store.newRecoveryCodes(who.userId) };
+      const recoveryCodes = store.newRecoveryCodes(who.userId);
+      notify({ userId: who.userId, kind: "recovery-codes-replaced" });
+      return { recoveryCodes };
     });
 
     app.post("/remove", async (request, reply) => {
       const who = caller(request, reply, ["full"]);
-      if (!who || blocked(who.userId, reply)) return;
+      if (!who) return;
       const body = removeBody.parse(request.body);
       if (!(await passwordOk(who, body.password, reply))) return;
       const factor = store.list(who.userId).find((f) => f.id === body.id);
@@ -299,6 +322,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
       const others = store.list(who.userId).filter((f) => f.kind !== "recovery" && f.id !== factor.id);
       if (others.length === 0 && (await isRequired(who.userId))) return reply.code(409).send({ error: "two-step login is required: add another factor first" });
       store.remove(who.userId, factor.id);
+      notify({ userId: who.userId, kind: "factor-removed", factor: factor.kind });
       return { status: "removed" };
     });
   }

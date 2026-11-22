@@ -3,7 +3,9 @@ import { and, eq } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createInviteStore } from "../invites.js";
 import { z } from "zod";
-import { createAttemptLimiter, MIN_SECRET_LENGTH, type AttemptLimit } from "../attemptLimiter.js";
+import { createAttemptLimiter, ipBucket, MIN_SECRET_LENGTH, type AttemptLimit } from "../attemptLimiter.js";
+import { createDeviceCookies, deriveDeviceKey } from "../auth/device.js";
+import { securityNotifier, type SecurityEventHandler } from "../securityEvents.js";
 import {
   buildAuthorizationRequest,
   createOidcClient,
@@ -17,7 +19,7 @@ import { user, userIdentity } from "../schema.js";
 import { typedSession, unsetSessionKeys, type TypedSession } from "../session.js";
 import { randomBytes, randomUUID } from "node:crypto";
 import type { SessionCache } from "../sessionCache.js";
-import { sessionStatus, type SelfServiceAuthorizer } from "../accountStatus.js";
+import { endOtherSessions, revokeSession, sessionStatus, type SelfServiceAuthorizer } from "../accountStatus.js";
 import { routeErrorHandler } from "./errors.js";
 import { createMfaRoutes, MFA_SESSION_KEYS, type MfaConfig } from "./mfa.js";
 
@@ -75,9 +77,27 @@ export interface AuthRoutesConfig {
    * the owner out; `perAccount` (default 100) counts an account from
    * everywhere, against guessing spread over many addresses; `perIp`
    * (default 50) counts one address across accounts. Window: 15 minutes.
-   * Behind a proxy, set Fastify's `trustProxy` so the IP is the client's.
+   * Addresses are counted per IPv4 address or IPv6 /64. Behind a proxy, set
+   * Fastify's `trustProxy` so the IP is the client's.
+   *
+   * A browser the account has fully logged in from before (a "known device"
+   * cookie) is counted on its own instead (`perAccountIp` per device), so
+   * guessing from elsewhere can't lock the owner out of their own browsers.
    */
   loginLimits?: { perAccountIp?: number; perAccount?: number; perIp?: number; windowMs?: number };
+  /**
+   * The known-device cookie (see `loginLimits`). `key`: HMAC key; default
+   * derived from the MFA key, or a random one per process (devices are then
+   * forgotten on restart). `secure`: HTTPS only; default when the request
+   * came over HTTPS.
+   */
+  deviceCookie?: { key?: Buffer; secure?: boolean };
+  /**
+   * Told about changes to how someone logs in (password changed, factors
+   * added or removed, new recovery codes, too many wrong codes), e.g. to
+   * email them. Runs after the change; a failure is logged, nothing more.
+   */
+  onSecurityEvent?: SecurityEventHandler;
   /**
    * Second factors for `single` mode (authenticator apps, login passkeys,
    * recovery codes), served under `/mfa`. Without it, a correct password
@@ -122,6 +142,16 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
   const perAccountIp = createAttemptLimiter({ max: config.loginLimits?.perAccountIp ?? 10, windowMs } satisfies AttemptLimit);
   const perAccount = createAttemptLimiter({ max: config.loginLimits?.perAccount ?? 100, windowMs });
   const perIp = createAttemptLimiter({ max: config.loginLimits?.perIp ?? 50, windowMs });
+  const perDevice = createAttemptLimiter({ max: config.loginLimits?.perAccountIp ?? 10, windowMs });
+  const devices = createDeviceCookies({
+    key: config.deviceCookie?.key ?? (config.mfa ? deriveDeviceKey(config.mfa.key) : randomBytes(32)),
+    secure: config.deviceCookie?.secure,
+  });
+  // Wrong passwords on a logged-in session (changing the password or factors), per account: a stolen
+  // cookie mustn't be a way to guess the password. Escalating, like second-factor codes.
+  const reauthFailures = createAttemptLimiter({ max: 10, windowMs: 15 * 60_000, escalate: { maxBlockMs: 24 * 60 * 60_000 } });
+  let logError: (error: unknown) => void = (error) => console.error("vault-service: onSecurityEvent failed", error);
+  const notify = securityNotifier(config.onSecurityEvent, (error) => logError(error));
   const bootstrapEmail = config.bootstrapEmail?.trim().toLowerCase() || undefined;
   /** Whether a login for an unknown account may create it. `verified`: the email is known to be the person's (OIDC). */
   const signupOpen = async (email: string | undefined, verified: boolean) => {
@@ -165,17 +195,30 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     session.set("loginAt", String(Date.now()));
   }
 
-  /** A real login: fresh session id, then the app's onLogin. */
-  async function completeLogin(session: TypedSession, userId: number, created: boolean, provider: "local" | "oidc", claims?: Record<string, unknown>) {
+  /** A real login: fresh session id, a known-device cookie for password logins, then the app's onLogin. */
+  async function completeLogin(request: FastifyRequest, reply: FastifyReply, userId: number, created: boolean, provider: "local" | "oidc", claims?: Record<string, unknown>) {
+    const session = typedSession(request);
     unsetSessionKeys(session, MFA_SESSION_KEYS);
     startLogin(session, userId);
+    if (provider === "local") devices.issue(request, reply, userId);
     await onLogin?.({ userId, created, provider, ...(claims ? { claims } : {}) });
   }
 
-  const mfa = config.mfa && mode === "single" ? createMfaRoutes({ db, config: config.mfa, completeLogin: (session, userId, created) => completeLogin(session, userId, created, "local") }) : undefined;
+  const mfa =
+    config.mfa && mode === "single"
+      ? createMfaRoutes({
+          db,
+          config: config.mfa,
+          completeLogin: (request, reply, userId, created) => completeLogin(request, reply, userId, created, "local"),
+          devices,
+          reauthFailures,
+          notify,
+        })
+      : undefined;
 
   /** After a correct password: logged in, or on to the second step when the person has (or must have) one. */
-  async function passwordAccepted(session: TypedSession, userId: number, created: boolean) {
+  async function passwordAccepted(request: FastifyRequest, reply: FastifyReply, userId: number, created: boolean) {
+    const session = typedSession(request);
     if (mfa) {
       const kinds = mfa.store.primaryKinds(userId);
       if (kinds.length > 0 || (await config.mfa!.required?.(userId))) {
@@ -183,7 +226,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         return kinds.length > 0 ? { status: "mfa_required", factors: kinds } : { status: "mfa_setup_required" };
       }
     }
-    await completeLogin(session, userId, created, "local");
+    await completeLogin(request, reply, userId, created, "local");
     return { status: "logged_in" };
   }
 
@@ -193,6 +236,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
   return async function authRoutes(app: FastifyInstance) {
     app.setErrorHandler(routeErrorHandler);
+    logError = (error) => app.log.error({ err: error }, "vault-service: onSecurityEvent failed");
 
     if (mfa) await app.register(mfa.routes, { prefix: "/mfa" });
 
@@ -214,19 +258,27 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
       const { email, password } = loginBodySchema.parse(request.body);
       const accountKey = email.toLowerCase();
-      const pairKey = `${accountKey} ${request.ip}`;
-      const wait = Math.max(perAccountIp.blockedFor(pairKey), perAccount.blockedFor(accountKey), perIp.blockedFor(request.ip));
+      const ipKey = ipBucket(request.ip);
+      const pairKey = `${accountKey} ${ipKey}`;
+      const [existingUser] = await db.select().from(user).where(eq(user.email, email));
+      // A browser this account logged in from before has its own count, untouched by guessing elsewhere.
+      const device = existingUser ? devices.read(request, existingUser.id) : undefined;
+      const wait = device
+        ? perDevice.blockedFor(device)
+        : Math.max(perAccountIp.blockedFor(pairKey), perAccount.blockedFor(accountKey), perIp.blockedFor(ipKey));
       if (wait > 0) {
         reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
         return;
       }
       const failed = () => {
-        perAccountIp.fail(pairKey);
-        perAccount.fail(accountKey);
-        perIp.fail(request.ip);
+        if (device) perDevice.fail(device);
+        else {
+          perAccountIp.fail(pairKey);
+          perAccount.fail(accountKey);
+          perIp.fail(ipKey);
+        }
         reply.code(401).send({ error: "wrong email or password" });
       };
-      const [existingUser] = await db.select().from(user).where(eq(user.email, email));
 
       // First login for this email bootstraps it - mirrors routes/vault.ts's
       // "first unlock creates the vault" shape, one level up the stack.
@@ -249,7 +301,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
         await db.insert(userIdentity).values({ userId: createdUser.id, provider: "local", passwordHash });
 
-        return passwordAccepted(typedSession(request), createdUser.id, true);
+        return passwordAccepted(request, reply, createdUser.id, true);
       }
 
       const [identity] = await db
@@ -262,14 +314,15 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         return failed();
       }
       if (!(await verifyPasswordHash(identity.passwordHash, password))) return failed();
-      // Only this address's count: guessing from elsewhere keeps counting against the account.
-      perAccountIp.clear(pairKey);
+      // Only this address's (or browser's) count: guessing from elsewhere keeps counting against the account.
+      if (device) perDevice.clear(device);
+      else perAccountIp.clear(pairKey);
 
       if (await isDisabled(existingUser.id)) {
         reply.code(403).send({ error: "account disabled" });
         return;
       }
-      return passwordAccepted(typedSession(request), existingUser.id, false);
+      return passwordAccepted(request, reply, existingUser.id, false);
     });
 
     /** Changes the caller's own login password (single mode). Not the vault passphrase - that's `PUT /vault/methods/password`. */
@@ -278,26 +331,40 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         reply.code(404).send({ error: 'auth mode is not "single"' });
         return;
       }
-      const authUserId = typedSession(request).get("authUserId");
-      if (authUserId === undefined) {
+      const session = typedSession(request);
+      const authUserId = session.get("authUserId");
+      // Outside requireAuth, so the same checks here: a disabled account's or logged-out session's cookie can't.
+      if (authUserId === undefined || sessionStatus(db, session) !== "ok") {
+        if (authUserId !== undefined) session.delete();
         reply.code(401).send({ error: "login required" });
         return;
       }
-      const sessionId = typedSession(request).get("id") ?? "";
-      if (config.authorize && !(await config.authorize({ userId: Number(authUserId), sessionId }, "auth:changePassword"))) {
+      const userId = Number(authUserId);
+      const sessionId = session.get("id") ?? "";
+      if (config.authorize && !(await config.authorize({ userId, sessionId }, "auth:changePassword"))) {
         reply.code(403).send({ error: "not allowed: auth:changePassword" });
         return;
       }
       const { currentPassword, newPassword } = changePasswordBodySchema.parse(request.body);
+      const wait = reauthFailures.blockedFor(String(userId));
+      if (wait > 0) {
+        reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
+        return;
+      }
       const [identity] = await db
         .select()
         .from(userIdentity)
-        .where(and(eq(userIdentity.userId, Number(authUserId)), eq(userIdentity.provider, "local")));
+        .where(and(eq(userIdentity.userId, userId), eq(userIdentity.provider, "local")));
       if (!identity?.passwordHash || !(await verifyPasswordHash(identity.passwordHash, currentPassword))) {
+        reauthFailures.fail(String(userId));
         reply.code(401).send({ error: "wrong password" });
         return;
       }
       await db.update(userIdentity).set({ passwordHash: await hashPassword(newPassword) }).where(eq(userIdentity.id, identity.id));
+      // Whoever else is logged in with the old password is out; this session carries on.
+      endOtherSessions(db, session, userId);
+      sessionCache?.dropUser(userId, sessionId);
+      notify({ userId, kind: "password-changed" });
       return { status: "changed" };
     });
 
@@ -326,14 +393,14 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
     /** The open invite behind a link, counting misses per address. */
     const openInvite = (request: FastifyRequest, reply: FastifyReply, token: string) => {
-      const wait = inviteMisses.blockedFor(request.ip);
+      const wait = inviteMisses.blockedFor(ipBucket(request.ip));
       if (wait > 0) {
         reply.code(429).header("retry-after", wait).send({ error: "too many attempts; try again later" });
         return undefined;
       }
       const invite = invites.find(token);
       if (!invite) {
-        inviteMisses.fail(request.ip);
+        inviteMisses.fail(ipBucket(request.ip));
         reply.code(404).send({ error: "this invite link has expired or was already used - ask for a new one" });
         return undefined;
       }
@@ -357,6 +424,8 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       if (!invite) return;
       if (await isDisabled(invite.userId)) return reply.code(403).send({ error: "account disabled" });
       const passwordHash = await hashPassword(password);
+      // Used up first, atomically: two requests racing with the same link can't both set a password.
+      if (!invites.accept(invite.id)) return reply.code(404).send({ error: "this invite link has expired or was already used - ask for a new one" });
       const updated = db
         .update(userIdentity)
         .set({ passwordHash })
@@ -364,8 +433,10 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         .returning({ id: userIdentity.id })
         .all();
       if (updated.length === 0) db.insert(userIdentity).values({ userId: invite.userId, provider: "local", passwordHash }).run();
-      invites.accept(invite.id);
-      return passwordAccepted(typedSession(request), invite.userId, false);
+      // A new password (a re-invite works as a reset): any login from before ends.
+      db.update(user).set({ sessionsValidAfter: new Date() }).where(eq(user.id, invite.userId)).run();
+      sessionCache?.dropUser(invite.userId);
+      return passwordAccepted(request, reply, invite.userId, false);
     });
 
     /** OIDC: remembers the invite and sends the person to the IdP; the callback ties their login to the invited account. */
@@ -511,7 +582,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         return refuseOidc(request, reply, 403, "disabled", "account disabled");
       }
       if (invite && invite.userId === authUserId) invites.accept(invite.id);
-      await completeLogin(session, authUserId, resolution.action === "create", "oidc", claims.raw);
+      await completeLogin(request, reply, authUserId, resolution.action === "create", "oidc", claims.raw);
       session.set("oidcState", "");
       session.set("oidcNonce", "");
       session.set("oidcCodeVerifier", "");
@@ -526,6 +597,8 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const session = typedSession(request);
       const sessionId = session.get("id");
       if (sessionId !== undefined) sessionCache?.dropSession(sessionId);
+      // Stateless cookies: without this, a copy of this one would still be logged in.
+      if (sessionId && session.get("authUserId") !== undefined) revokeSession(db, sessionId);
       session.delete();
       return { status: "logged_out" };
     });

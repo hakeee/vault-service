@@ -46,6 +46,7 @@ import { handleOidcCallback } from "./auth/oidc.js";
 import { createRequireAuth } from "./requireAuth.js";
 import { createRequireCaller } from "./requireCaller.js";
 import { createAccountStore } from "./accounts.js";
+import { createInviteStore } from "./invites.js";
 import { createRequireVault } from "./requireVault.js";
 import { createAuthRoutes } from "./routes/auth.js";
 import { createInternalRoutes } from "./routes/internal.js";
@@ -142,7 +143,7 @@ describe("mode: none - vault unlock + internal crypto service", () => {
     });
 
     expect(unlockRes.statusCode).toBe(200);
-    const sessionCookie = unlockRes.cookies[0]!;
+    const sessionCookie = unlockRes.cookies.find((c: { name: string }) => c.name === "session")!;
     const session = app.decodeSecureSession(sessionCookie.value);
     const sessionId = session?.get("id");
     expect(sessionId).toBeTypeOf("string");
@@ -201,7 +202,7 @@ describe("mode: single - login", () => {
       payload: { email: "me@example.com", password: "correct horse battery staple" },
     });
     expect(loginRes.statusCode).toBe(200);
-    const cookie = loginRes.cookies[0]!;
+    const cookie = loginRes.cookies.find((c: { name: string }) => c.name === "session")!;
 
     const res = await app.inject({ method: "GET", url: "/vault/status", cookies: { [cookie.name]: cookie.value } });
     expect(res.statusCode).toBe(200);
@@ -213,10 +214,10 @@ describe("mode: single - login", () => {
       url: "/auth/login",
       payload: { email: "me@example.com", password: "correct horse battery staple" },
     });
-    const cookie = loginRes.cookies[0]!;
+    const cookie = loginRes.cookies.find((c: { name: string }) => c.name === "session")!;
 
     const logoutRes = await app.inject({ method: "POST", url: "/auth/logout", cookies: { [cookie.name]: cookie.value } });
-    const clearedCookie = logoutRes.cookies[0]!;
+    const clearedCookie = logoutRes.cookies.find((c: { name: string }) => c.name === "session")!;
 
     const statusRes = await app.inject({
       method: "GET",
@@ -241,18 +242,18 @@ describe("mode: single - lock", () => {
       url: "/auth/login",
       payload: { email: "me@example.com", password: "correct horse battery staple" },
     });
-    let cookie = loginRes.cookies[0]!;
+    let cookie = loginRes.cookies.find((c: { name: string }) => c.name === "session")!;
     const unlockRes = await app.inject({
       method: "POST",
       url: "/vault/unlock",
       cookies: { [cookie.name]: cookie.value },
       payload: { password: "vault passphrase" },
     });
-    cookie = unlockRes.cookies[0] ?? cookie;
+    cookie = unlockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     const lockRes = await app.inject({ method: "POST", url: "/vault/lock", cookies: { [cookie.name]: cookie.value } });
     expect(lockRes.statusCode).toBe(200);
-    cookie = lockRes.cookies[0] ?? cookie;
+    cookie = lockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     const statusRes = await app.inject({ method: "GET", url: "/vault/status", cookies: { [cookie.name]: cookie.value } });
     expect(statusRes.statusCode).toBe(200);
@@ -273,21 +274,24 @@ describe("mode: single - logout", () => {
     const { app } = buildTestApp("single");
     await app.ready();
     const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "password1" } });
-    const cookie = loginRes.cookies[0]!;
+    const cookie = loginRes.cookies.find((c: { name: string }) => c.name === "session")!;
     const unlockRes = await app.inject({
       method: "POST",
       url: "/vault/unlock",
       cookies: { [cookie.name]: cookie.value },
       payload: { password: "passphrase" },
     });
-    const oldCookie = unlockRes.cookies[0] ?? cookie;
+    const oldCookie = unlockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     await app.inject({ method: "POST", url: "/auth/logout", cookies: { [oldCookie.name]: oldCookie.value } });
 
-    // secure-session cookies are stateless: the old one still authenticates.
+    // secure-session cookies are stateless, but the session id is revoked: a copy of the old cookie is logged out too.
     const statusRes = await app.inject({ method: "GET", url: "/vault/status", cookies: { [oldCookie.name]: oldCookie.value } });
-    expect(statusRes.statusCode).toBe(200);
-    expect(statusRes.json()).toMatchObject({ unlocked: false });
+    expect(statusRes.statusCode).toBe(401);
+    expect((await app.inject({ method: "GET", url: "/whoami", cookies: { [oldCookie.name]: oldCookie.value } })).statusCode).toBe(401);
+    // Logging in again works as usual.
+    const again = (await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "password1" } })).cookies.find((c: { name: string }) => c.name === "session")!;
+    expect((await app.inject({ method: "GET", url: "/whoami", cookies: { [again.name]: again.value } })).statusCode).toBe(200);
   });
 });
 
@@ -299,7 +303,7 @@ describe("mode: single - guessing and weak secrets", () => {
     const { app } = buildTestApp("single");
     await app.ready();
     expect((await login(app, "me@example.com", "pw")).statusCode).toBe(400);
-    const cookie = (await login(app, "me@example.com", "password1")).cookies[0]!;
+    const cookie = (await login(app, "me@example.com", "password1")).cookies.find((c: { name: string }) => c.name === "session")!;
     const unlock = (password: string) => app.inject({ method: "POST", url: "/vault/unlock", cookies: { [cookie.name]: cookie.value }, payload: { password } });
     expect((await unlock("pass")).statusCode).toBe(400);
     expect((await unlock("passphrase")).statusCode).toBe(200);
@@ -318,7 +322,7 @@ describe("mode: single - guessing and weak secrets", () => {
   it("blocks vault unlocks after too many wrong passphrases", async () => {
     const { app } = buildTestApp("single");
     await app.ready();
-    const cookie = (await login(app, "me@example.com", "password1")).cookies[0]!;
+    const cookie = (await login(app, "me@example.com", "password1")).cookies.find((c: { name: string }) => c.name === "session")!;
     const unlock = (password: string) => app.inject({ method: "POST", url: "/vault/unlock", cookies: { [cookie.name]: cookie.value }, payload: { password } });
     expect((await unlock("passphrase")).statusCode).toBe(200);
     for (let i = 0; i < 10; i++) expect((await unlock("wrong-guess")).statusCode).toBe(401);
@@ -400,7 +404,7 @@ describe("bootstrapEmail - only the owner creates the first account", () => {
     await app.ready();
     const callback = async (subject: string, email: string, emailVerified: boolean) => {
       vi.mocked(handleOidcCallback).mockResolvedValueOnce({ issuer: "https://idp.example.com", subject, email, emailVerified, isAuthorized: true });
-      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies.find((c: { name: string }) => c.name === "session")!;
       return app.inject({ method: "GET", url: "/auth/oidc/callback?code=c&state=test-state", cookies: { [cookie.name]: cookie.value } });
     };
     expect((await callback("s1", "stranger@example.com", true)).statusCode).toBe(403);
@@ -412,7 +416,7 @@ describe("bootstrapEmail - only the owner creates the first account", () => {
     const { app } = buildTestApp("oidc");
     await app.ready();
     vi.mocked(handleOidcCallback).mockRejectedValueOnce(new Error("state mismatch: internal detail"));
-    const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+    const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies.find((c: { name: string }) => c.name === "session")!;
     const res = await app.inject({ method: "GET", url: "/auth/oidc/callback?code=c&state=test-state", cookies: { [cookie.name]: cookie.value } });
     expect(res.statusCode).toBe(400);
     expect(res.json().error).not.toContain("internal detail");
@@ -422,7 +426,7 @@ describe("bootstrapEmail - only the owner creates the first account", () => {
     const { app } = buildTestApp("oidc", { signup: "closed", bootstrapEmail: "owner@example.com" });
     await app.ready();
     const browserCallback = async () => {
-      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies.find((c: { name: string }) => c.name === "session")!;
       return app.inject({
         method: "GET",
         url: "/auth/oidc/callback?code=c&state=test-state",
@@ -450,7 +454,7 @@ describe("mode: single - caller without the vault", () => {
     expect((await app.inject({ method: "GET", url: "/whoami" })).statusCode).toBe(401);
 
     const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "password1" } });
-    let cookie = loginRes.cookies[0]!;
+    let cookie = loginRes.cookies.find((c: { name: string }) => c.name === "session")!;
     const whoRes = await app.inject({ method: "GET", url: "/whoami", cookies: { [cookie.name]: cookie.value } });
     expect(whoRes.statusCode).toBe(200);
     const who = whoRes.json() as { userId: number; sessionId: string };
@@ -463,7 +467,7 @@ describe("mode: single - caller without the vault", () => {
       cookies: { [cookie.name]: cookie.value },
       payload: { password: "passphrase" },
     });
-    cookie = unlockRes.cookies[0] ?? cookie;
+    cookie = unlockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
     const secretRes = await app.inject({ method: "GET", url: "/secret", cookies: { [cookie.name]: cookie.value } });
     expect(secretRes.json()).toEqual(who);
   });
@@ -472,14 +476,14 @@ describe("mode: single - caller without the vault", () => {
     const { app } = buildTestApp("single");
     await app.ready();
     const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email: "a@example.com", password: "password1" } });
-    let cookie = loginRes.cookies[0]!;
+    let cookie = loginRes.cookies.find((c: { name: string }) => c.name === "session")!;
     const unlockRes = await app.inject({
       method: "POST",
       url: "/vault/unlock",
       cookies: { [cookie.name]: cookie.value },
       payload: { password: "passphrase" },
     });
-    cookie = unlockRes.cookies[0] ?? cookie;
+    cookie = unlockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     // Another account logs in from the same browser without logging out first.
     const secondRes = await app.inject({
@@ -488,7 +492,7 @@ describe("mode: single - caller without the vault", () => {
       cookies: { [cookie.name]: cookie.value },
       payload: { email: "b@example.com", password: "password1" },
     });
-    cookie = secondRes.cookies[0] ?? cookie;
+    cookie = secondRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
     expect((await app.inject({ method: "GET", url: "/secret", cookies: { [cookie.name]: cookie.value } })).statusCode).toBe(423);
   });
 });
@@ -521,7 +525,7 @@ describe("mode: single - closed signup, onLogin, accounts", () => {
   it("changes the login password, checking the current one", async () => {
     const { app } = buildTestApp("single");
     await app.ready();
-    const cookie = (await login(app, "me@example.com", "first-password")).cookies[0]!;
+    const cookie = (await login(app, "me@example.com", "first-password")).cookies.find((c: { name: string }) => c.name === "session")!;
     const change = (currentPassword: string) =>
       app.inject({
         method: "POST",
@@ -537,7 +541,7 @@ describe("mode: single - closed signup, onLogin, accounts", () => {
 });
 
 describe("mode: single - account status and self-service rules", () => {
-  const cookieOf = (res: { cookies: { name: string; value: string }[] }, prev?: { name: string; value: string }) => res.cookies[0] ?? prev!;
+  const cookieOf = (res: { cookies: { name: string; value: string }[] }, prev?: { name: string; value: string }) => res.cookies.find((c: { name: string }) => c.name === "session") ?? prev!;
   async function loggedIn(app: ReturnType<typeof Fastify>, email: string, password = "password1") {
     let cookie = cookieOf(await app.inject({ method: "POST", url: "/auth/login", payload: { email, password } }));
     cookie = cookieOf(await app.inject({ method: "POST", url: "/vault/unlock", cookies: { [cookie.name]: cookie.value }, payload: { password: "passphrase" } }), cookie);
@@ -583,7 +587,10 @@ describe("mode: single - account status and self-service rules", () => {
     const fresh = await loggedIn(app, "me@example.com");
     expect((await get(app, "/vault/status", fresh)).statusCode).toBe(200);
 
+    await new Promise((r) => setTimeout(r, 5));
     expect(await accounts.resetPassword(1, "temporary-pass")).toEqual({ ok: true });
+    // A reset password ends the sessions from before it.
+    expect((await get(app, "/vault/status", fresh)).statusCode).toBe(401);
     expect((await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "password1" } })).statusCode).toBe(401);
     expect((await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "temporary-pass" } })).statusCode).toBe(200);
     expect(await accounts.resetPassword(999, "x")).toEqual({ error: "no-local-login" });
@@ -617,14 +624,14 @@ describe("mode: single - passkey ownership", () => {
   /** Logs in, unlocks, registers one passkey; returns the logged-in cookie. */
   async function userWithPasskey(email: string, credentialId: string) {
     const loginRes = await app.inject({ method: "POST", url: "/auth/login", payload: { email, password: "password1" } });
-    let cookie = loginRes.cookies[0]!;
+    let cookie = loginRes.cookies.find((c: { name: string }) => c.name === "session")!;
     const unlockRes = await app.inject({
       method: "POST",
       url: "/vault/unlock",
       cookies: { [cookie.name]: cookie.value },
       payload: { password: "passphrase" },
     });
-    cookie = unlockRes.cookies[0] ?? cookie;
+    cookie = unlockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     vi.mocked(createPasskeyRegistrationChallenge).mockResolvedValueOnce({
       options: { challenge: "reg" } as never,
@@ -636,7 +643,7 @@ describe("mode: single - passkey ownership", () => {
       url: "/vault/methods/passkey/register-options",
       cookies: { [cookie.name]: cookie.value },
     });
-    cookie = optionsRes.cookies[0] ?? cookie;
+    cookie = optionsRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     vi.mocked(verifyPasskeyRegistration).mockResolvedValueOnce({
       credentialId,
@@ -650,7 +657,7 @@ describe("mode: single - passkey ownership", () => {
       payload: { response: {}, prfOutput: "cHJmLW91dA", label: "device" },
     });
     expect(registerRes.statusCode).toBe(200);
-    return registerRes.cookies[0] ?? cookie;
+    return registerRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
   }
 
   it("rejects another user's passkey", async () => {
@@ -658,7 +665,7 @@ describe("mode: single - passkey ownership", () => {
     await userWithPasskey("b@example.com", "cred-b");
 
     const lockRes = await app.inject({ method: "POST", url: "/vault/lock", cookies: { [cookie.name]: cookie.value } });
-    cookie = lockRes.cookies[0] ?? cookie;
+    cookie = lockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     vi.mocked(createPasskeyAuthenticationChallenge).mockResolvedValueOnce({
       options: { challenge: "auth" } as never,
@@ -670,7 +677,7 @@ describe("mode: single - passkey ownership", () => {
       url: "/vault/methods/passkey/auth-options",
       cookies: { [cookie.name]: cookie.value },
     });
-    cookie = optionsRes.cookies[0] ?? cookie;
+    cookie = optionsRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     vi.mocked(verifyPasskeyAuthentication).mockResolvedValue({ newCounter: 0 });
     const foreignRes = await app.inject({
@@ -705,7 +712,7 @@ describe("mode: oidc - closed signup and onLogin", () => {
         isAuthorized: true,
         raw: { sub: subject, roles: ["admin"] },
       });
-      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies[0]!;
+      const cookie = (await app.inject({ method: "GET", url: "/auth/oidc/login" })).cookies.find((c: { name: string }) => c.name === "session")!;
       return app.inject({ method: "GET", url: "/auth/oidc/callback?code=c&state=test-state", cookies: { [cookie.name]: cookie.value } });
     };
 
@@ -728,7 +735,7 @@ describe("mode: oidc - callback resolution", () => {
   /** Starts a login, returning the cookie the callback needs to find the stashed state/nonce/verifier. */
   async function startLogin() {
     const res = await app.inject({ method: "GET", url: "/auth/oidc/login" });
-    return res.cookies[0]!;
+    return res.cookies.find((c: { name: string }) => c.name === "session")!;
   }
 
   // `isAuthorizedClaims` itself (default vs. a custom predicate, run
@@ -787,7 +794,7 @@ describe("passkey and recovery-key unlock methods", () => {
       url: "/vault/unlock",
       payload: { password: "correct horse battery staple" },
     });
-    cookie = unlockRes.cookies[0]!;
+    cookie = unlockRes.cookies.find((c: { name: string }) => c.name === "session")!;
   });
 
   it("registers a passkey and unlocks a fresh session with it", async () => {
@@ -802,7 +809,7 @@ describe("passkey and recovery-key unlock methods", () => {
       url: "/vault/methods/passkey/register-options",
       cookies: { [cookie.name]: cookie.value },
     });
-    cookie = optionsRes.cookies[0] ?? cookie;
+    cookie = optionsRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     vi.mocked(verifyPasskeyRegistration).mockResolvedValueOnce({
       credentialId: "cred-1",
@@ -824,7 +831,7 @@ describe("passkey and recovery-key unlock methods", () => {
       prfSaltByCredentialId: { "cred-1": "cHJmLXNhbHQtMQ" },
     });
     const optionsRes2 = await app.inject({ method: "GET", url: "/vault/methods/passkey/auth-options" });
-    const freshCookie = optionsRes2.cookies[0]!;
+    const freshCookie = optionsRes2.cookies.find((c: { name: string }) => c.name === "session")!;
 
     vi.mocked(verifyPasskeyAuthentication).mockResolvedValueOnce({ newCounter: 1 });
     const verifyRes = await app.inject({
@@ -890,7 +897,7 @@ describe("passkey and recovery-key unlock methods", () => {
     const recovery = (methodsRes.json() as { methods: { id: number; method: string }[] }).methods.find((m) => m.method === "recovery")!;
 
     const lockRes = await app.inject({ method: "POST", url: "/vault/lock", cookies: { [cookie.name]: cookie.value } });
-    const locked = lockRes.cookies[0] ?? cookie;
+    const locked = lockRes.cookies.find((c: { name: string }) => c.name === "session") ?? cookie;
 
     const changeRes = await app.inject({
       method: "PUT",
@@ -909,7 +916,7 @@ describe("passkey and recovery-key unlock methods", () => {
       payload: { password: "correct horse battery staple" },
     });
     expect(unlockRes.statusCode).toBe(200);
-    const unlocked = unlockRes.cookies[0] ?? locked;
+    const unlocked = unlockRes.cookies.find((c: { name: string }) => c.name === "session") ?? locked;
     const deleteUnlockedRes = await app.inject({
       method: "DELETE",
       url: `/vault/methods/${recovery.id}`,
@@ -928,7 +935,7 @@ describe("mode: single - two-step login (MFA)", () => {
     let cookie: { name: string; value: string } | undefined;
     return async (method: "GET" | "POST", url: string, payload?: unknown, remoteAddress?: string) => {
       const res = await app.inject({ method, url, ...(payload === undefined ? {} : { payload: payload as object }), ...(cookie ? { cookies: { [cookie.name]: cookie.value } } : {}), ...(remoteAddress ? { remoteAddress } : {}) });
-      const set = res.cookies.find((c) => c.name === "session");
+      const set = res.cookies.find((c: { name: string }) => c.name === "session");
       if (set) cookie = set.value ? { name: set.name, value: set.value } : undefined;
       return res;
     };
@@ -1100,7 +1107,7 @@ describe("invites and OIDC hardening", () => {
     let cookie: { name: string; value: string } | undefined;
     return async (method: "GET" | "POST", url: string, payload?: unknown, remoteAddress?: string) => {
       const res = await app.inject({ method, url, ...(payload === undefined ? {} : { payload: payload as object }), ...(cookie ? { cookies: { [cookie.name]: cookie.value } } : {}), ...(remoteAddress ? { remoteAddress } : {}) });
-      const set = res.cookies.find((c) => c.name === "session");
+      const set = res.cookies.find((c: { name: string }) => c.name === "session");
       if (set) cookie = set.value ? { name: set.name, value: set.value } : undefined;
       return res;
     };
@@ -1308,5 +1315,185 @@ describe("invites and OIDC hardening", () => {
     const accounts = createAccountStore(db, { provisioner });
     expect(await accounts.invite({ email: "jana@example.com", displayName: "Jana" })).toMatchObject({ error: "idp" });
     expect(await accounts.list()).toEqual([]);
+  });
+});
+
+describe("hardening from the 2026-11 audit", () => {
+  type Cookie = { name: string; value: string };
+  /** One browser: keeps its cookies (session and known device) between requests. */
+  function browser(app: ReturnType<typeof buildTestApp>["app"], remoteAddress = "127.0.0.1") {
+    const jar = new Map<string, string>();
+    const call = async (method: "GET" | "POST", url: string, payload?: unknown) => {
+      const res = await app.inject({ method, url, remoteAddress, cookies: Object.fromEntries(jar), ...(payload === undefined ? {} : { payload: payload as object }) });
+      for (const c of res.cookies) c.value ? jar.set(c.name, c.value) : jar.delete(c.name);
+      return res;
+    };
+    return Object.assign(call, { jar, cookie: (name = "session"): Cookie => ({ name, value: jar.get(name)! }) });
+  }
+  const webauthn = { rpID: "localhost", rpName: "Test App", origin: "http://localhost:5173" };
+  const codeFor = (secret: string, offsetSteps = 0) => totpCode(base32Decode(secret), totpStep(Date.now()) + offsetSteps);
+
+  it("changing the password: a stolen cookie can't be used to guess the current one at full speed", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    const mine = browser(app);
+    await mine("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const thief = browser(app);
+    thief.jar.set("session", mine.jar.get("session")!);
+    for (let i = 0; i < 10; i++) expect((await thief("POST", "/auth/password", { currentPassword: `guess-${i}`, newPassword: "newpassword1" })).statusCode).toBe(401);
+    expect((await thief("POST", "/auth/password", { currentPassword: "password1", newPassword: "newpassword1" })).statusCode).toBe(429);
+  });
+
+  it("changing the password ends the other logins and their vaults, keeps this one, and tells the app", async () => {
+    const events: unknown[] = [];
+    const { app, sessionCache } = buildTestApp("single", { onSecurityEvent: (e) => void events.push(e) });
+    await app.ready();
+    const mine = browser(app);
+    await mine("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    await mine("POST", "/vault/unlock", { password: "passphrase" });
+    const copy = mine.jar.get("session")!;
+    const other = browser(app);
+    await other("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    await other("POST", "/vault/unlock", { password: "passphrase" });
+    await new Promise((r) => setTimeout(r, 5));
+
+    expect((await mine("POST", "/auth/password", { currentPassword: "password1", newPassword: "newpassword1" })).statusCode).toBe(200);
+    expect((await mine("GET", "/secret")).statusCode).toBe(200);
+    expect((await other("GET", "/whoami")).statusCode).toBe(401);
+    expect(sessionCache.unlockedSessions()).toHaveLength(1);
+    // Even a copy of this session's own cookie from before the change is out: only the browser that changed it carries on.
+    expect((await app.inject({ method: "GET", url: "/whoami", cookies: { session: copy } })).statusCode).toBe(401);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(events).toEqual([{ userId: 1, kind: "password-changed" }]);
+  });
+
+  it("a disabled account's (or logged-out) cookie can't change the password", async () => {
+    const { app, db, sessionCache } = buildTestApp("single");
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const copy = b.jar.get("session")!;
+    await createAccountStore(db, { sessionCache }).disable(1);
+    const res = await app.inject({ method: "POST", url: "/auth/password", cookies: { session: copy }, payload: { currentPassword: "password1", newPassword: "newpassword1" } });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it("a known browser still logs in while the account is locked out by guessing from many addresses", async () => {
+    const { app } = buildTestApp("single", { loginLimits: { perAccount: 5 } });
+    await app.ready();
+    const owner = browser(app, "10.0.0.1");
+    expect((await owner("POST", "/auth/login", { email: "me@example.com", password: "password1" })).statusCode).toBe(200);
+    expect(owner.jar.has("known_device")).toBe(true);
+    await owner("POST", "/auth/logout");
+
+    for (let i = 0; i < 5; i++) await app.inject({ method: "POST", url: "/auth/login", remoteAddress: `10.0.1.${i}`, payload: { email: "me@example.com", password: "wrong-guess" } });
+    // Strangers (and a new browser of the owner's) are locked out...
+    const stranger = browser(app, "10.0.0.1");
+    expect((await stranger("POST", "/auth/login", { email: "me@example.com", password: "password1" })).statusCode).toBe(429);
+    // ...the owner's known browser isn't.
+    expect((await owner("POST", "/auth/login", { email: "me@example.com", password: "password1" })).statusCode).toBe(200);
+
+    // The cookie only counts for its own account, and only as signed.
+    await app.inject({ method: "POST", url: "/auth/login", payload: { email: "other@example.com", password: "password1" } });
+    const device = owner.jar.get("known_device")!;
+    const forged = device.replace(/^1\./, "2.");
+    for (const value of [device, forged]) {
+      const res = await app.inject({ method: "POST", url: "/auth/login", remoteAddress: "10.0.9.9", cookies: { known_device: value }, payload: { email: "other@example.com", password: "password1" } });
+      expect(res.statusCode).toBe(200);
+    }
+    const tampered = await app.inject({ method: "POST", url: "/auth/login", remoteAddress: "10.0.0.1", cookies: { known_device: `${device.slice(0, -2)}xx` }, payload: { email: "me@example.com", password: "password1" } });
+    expect(tampered.statusCode).toBe(429);
+
+    // A known browser has its own small budget for wrong passwords.
+    for (let i = 0; i < 10; i++) expect((await owner("POST", "/auth/login", { email: "me@example.com", password: "typo" })).statusCode).toBe(401);
+    expect((await owner("POST", "/auth/login", { email: "me@example.com", password: "password1" })).statusCode).toBe(429);
+  });
+
+  it("counts IPv6 addresses by their /64", async () => {
+    const { app } = buildTestApp("single");
+    await app.ready();
+    await app.inject({ method: "POST", url: "/auth/login", payload: { email: "me@example.com", password: "password1" } });
+    const from = (remoteAddress: string, password: string) => app.inject({ method: "POST", url: "/auth/login", remoteAddress, payload: { email: "me@example.com", password } });
+    for (let i = 0; i < 10; i++) expect((await from(`2001:db8:1:2::${i + 1}`, "wrong-guess")).statusCode).toBe(401);
+    expect((await from("2001:db8:1:2:ffff::1", "password1")).statusCode).toBe(429);
+    expect((await from("2001:db8:1:3::1", "password1")).statusCode).toBe(200);
+  });
+
+  it("second-factor codes: blocks escalate, per browser, and the app hears about blocks and new factors", async () => {
+    const events: { kind: string }[] = [];
+    const { app } = buildTestApp("single", { mfa: { key: randomBytes(32), issuer: "Test App", webauthn, required: () => true }, onSecurityEvent: (e) => void events.push(e) });
+    await app.ready();
+    const owner = browser(app);
+    await owner("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const { secret } = (await owner("POST", "/auth/mfa/totp/setup")).json();
+    await owner("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) });
+    expect(owner.jar.has("known_device")).toBe(true);
+    await owner("POST", "/auth/logout");
+
+    const attacker = browser(app, "10.6.6.6");
+    const now = Date.now();
+    let t = now;
+    vi.spyOn(Date, "now").mockImplementation(() => t);
+    try {
+      const blockFor = async () => {
+        await attacker("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+        for (let i = 0; i < 10; i++) await attacker("POST", "/auth/mfa/verify/totp", { code: "000000" });
+        return Number((await attacker("POST", "/auth/mfa/verify/totp", { code: "000000" })).headers["retry-after"]);
+      };
+      expect(await blockFor()).toBe(15 * 60);
+      t += 15 * 60_000 + 1000;
+      expect(await blockFor()).toBe(30 * 60);
+
+      // The owner's known browser isn't blocked by the attacker's tries.
+      await owner("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+      expect((await owner("POST", "/auth/mfa/verify/totp", { code: codeFor(secret, 1) })).json()).toEqual({ status: "logged_in" });
+    } finally {
+      vi.restoreAllMocks();
+    }
+    await new Promise((r) => setTimeout(r, 0));
+    expect(events.map((e) => e.kind)).toEqual(["factor-added", "mfa-blocked", "mfa-blocked"]);
+  });
+
+  it("recovery codes are stored as HMACs; codes stored the old way still work", async () => {
+    const { app, db } = buildTestApp("single", { mfa: { key: randomBytes(32), issuer: "Test App", webauthn, required: () => true } });
+    await app.ready();
+    const b = browser(app);
+    await b("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    const { secret } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    const { recoveryCodes } = (await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) })).json();
+    const row = db.select().from(schema.userMfaFactor).all().find((r) => r.kind === "recovery")!;
+    const stored = JSON.parse(row.codes!) as string[];
+    expect(stored.every((h) => h.startsWith("h1:"))).toBe(true);
+
+    // A row from before: plain sha256 hex.
+    const { createHash } = await import("node:crypto");
+    const legacy = "abcde-fghjk";
+    db.update(schema.userMfaFactor).set({ codes: JSON.stringify([createHash("sha256").update("abcdefghjk").digest("hex"), ...stored]) }).run();
+    const use = async (code: string) => {
+      const c = browser(app);
+      await c("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+      return (await c("POST", "/auth/mfa/verify/recovery", { code })).statusCode;
+    };
+    expect(await use(legacy)).toBe(200);
+    expect(await use(legacy)).toBe(401);
+    expect(await use(recoveryCodes[0])).toBe(200);
+  });
+
+  it("an invite link sets a password once even when two requests race, and ends earlier logins", async () => {
+    const { app, db, sessionCache } = buildTestApp("single", { signup: "closed" });
+    await app.ready();
+    await app.inject({ method: "POST", url: "/auth/login", payload: { email: "owner@example.com", password: "password1" } });
+    const accounts = createAccountStore(db, { sessionCache });
+    const created = await accounts.create({ email: "member@example.com", password: "temporary1", displayName: "M" });
+    const member = browser(app);
+    await member("POST", "/auth/login", { email: "member@example.com", password: "temporary1" });
+    expect((await member("GET", "/whoami")).statusCode).toBe(200);
+    const { token } = createInviteStore(db).issue("id" in created ? created.id : 0);
+    await new Promise((r) => setTimeout(r, 5));
+
+    const accept = (password: string) => app.inject({ method: "POST", url: `/auth/invites/${token}/accept`, payload: { password } });
+    const results = await Promise.all([accept("first-password"), accept("second-password")]);
+    expect(results.map((r) => r.statusCode).sort()).toEqual([200, 404]);
+    expect((await member("GET", "/whoami")).statusCode).toBe(401);
   });
 });

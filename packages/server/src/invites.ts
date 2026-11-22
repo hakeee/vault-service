@@ -30,8 +30,15 @@ export function createInviteStore(db: BetterSQLite3Database<any>, options: { day
       return { id: row.id, userId: row.userId, expiresAt: row.expiresAt };
     },
 
-    accept(id: number): void {
-      db.update(userInvite).set({ acceptedAt: new Date() }).where(eq(userInvite.id, id)).run();
+    /** Uses the invite up. False when it was already used or revoked (e.g. by a request racing this one). */
+    accept(id: number): boolean {
+      const done = db
+        .update(userInvite)
+        .set({ acceptedAt: new Date() })
+        .where(and(eq(userInvite.id, id), isNull(userInvite.acceptedAt), isNull(userInvite.revokedAt)))
+        .returning({ id: userInvite.id })
+        .all();
+      return done.length > 0;
     },
 
     revoke(userId: number): void {

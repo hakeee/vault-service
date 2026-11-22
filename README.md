@@ -141,8 +141,19 @@ login and the rest after unlock:
 - Guessing limits (`loginLimits`, 15-minute window): `perAccountIp` 10
   failed logins for one account from one address, `perAccount` 100 from
   everywhere, `perIp` 50 per address; then a 429 with `Retry-After`. A
-  success clears only that address's count. Unknown accounts get a dummy
-  Argon2 check, so timing doesn't reveal which emails exist.
+  success clears only that address's count. Addresses count per IPv4
+  address or IPv6 /64 (`ipBucket`), since one machine usually has a whole
+  /64. Unknown accounts get a dummy Argon2 check, so timing doesn't reveal
+  which emails exist.
+- Known devices: a full password login sets a signed, long-lived
+  `known_device` cookie (180 days, HttpOnly, SameSite=Strict). A login
+  that brings one for its own account skips `perAccount` and `perIp` and
+  gets its own budget of `perAccountIp` failures, so someone guessing from
+  many addresses locks out strangers, not the owner's browsers. It proves
+  nothing by itself. `deviceCookie: { key?, secure? }`: the key defaults
+  to one derived from the MFA key (random per process without MFA, so
+  devices are forgotten on restart); `secure` defaults to the request
+  being HTTPS. Needs `@fastify/cookie`, which secure-session registers.
 - Auth and vault routes answer unexpected errors with a bare
   `{"error":"internal error"}` 500 (details in the log). A failed OIDC
   code exchange is a 400 "login failed; please try again".
@@ -154,7 +165,17 @@ login and the rest after unlock:
   for mapping IdP roles.
 - `POST /auth/password` (`useChangeLoginPassword`) changes your own login
   password, checking the current one. It's separate from the vault
-  passphrase.
+  passphrase. Wrong current passwords count per account (10, then blocks
+  that double each time, up to a day), shared with the password checks on
+  the MFA routes, so a stolen cookie can't be used to guess the password.
+  A session that's ended (disabled, logged out) can't use it. Afterwards
+  every other login of the account ends, including copies of this
+  session's cookie from before, and their vaults lock.
+- `onSecurityEvent(event)` hears about `password-changed`, `factor-added`,
+  `factor-removed`, `recovery-codes-replaced` and `mfa-blocked` (too many
+  wrong codes: someone may have the password), with `{ userId, kind,
+  factor? }`, e.g. to email the person. It runs after the change; a
+  failure is only logged.
 
 ## Invites
 
@@ -207,8 +228,10 @@ login and the rest after unlock:
 For `single` mode. Pass `mfa` to `createAuthRoutes`:
 `{ key, issuer, webauthn, required?, maxFailures? }`.
 
-- `key`: 32 bytes (`openssl rand -hex 32`), encrypts TOTP secrets at
-  rest. Losing it means everyone sets up their authenticator again.
+- `key`: 32 bytes (`openssl rand -hex 32`), encrypts TOTP secrets and
+  keys the recovery code hashes (HMAC, `h1:` prefix; codes stored as plain
+  sha256 before this keep working until replaced). Losing it means
+  everyone sets up their authenticator again.
 - Factors (table `user_mfa_factor`, not the vault, because login comes
   before unlock): **authenticator apps** (TOTP, RFC 6238; each code works
   once), **login passkeys** (WebAuthn without PRF, so password managers
@@ -229,8 +252,10 @@ For `single` mode. Pass `mfa` to `createAuthRoutes`:
   `POST /remove`. Once fully logged in, adding, removing and new codes need
   the login password again (`password` in the body), so a stolen cookie
   can't change factors. The last factor can't be removed while two-step
-  login is required. Wrong codes count like wrong passwords (10 per account
-  in 15 minutes, then 429).
+  login is required. Wrong codes count per account and browser (a known
+  device has its own count): 10, then a 15-minute block, and each next
+  block twice as long, up to a day, until a day passes without one. Wrong
+  passwords on these routes count with `POST /auth/password`'s.
 - Accounts: `resetMfa(userId)` removes every factor and ends the person's
   sessions (lost phone); `list()` says who has `mfa`; `erase` removes
   factors too. `createMfaStore(db, key)` is exported for server-side tools.
@@ -246,13 +271,18 @@ For `single` mode. Pass `mfa` to `createAuthRoutes`:
   checks `user.disabled_at` and `user.sessions_valid_after` against the
   session's login time. Session cookies are stateless, so this is how
   "disable" and "log out everywhere" take effect immediately: the cookie
-  is still valid, but the session no longer counts. `/auth/status` and
-  `createRequireCaller` check the same thing. Disabled accounts get a 403
+  is still valid, but the session no longer counts. Logging out lists the
+  session id in `revoked_session`, so a copy of the cookie is logged out
+  too, and no login lasts longer than `MAX_SESSION_AGE_MS` (7 days; the
+  cookie itself expires after a day), which is how long those rows are
+  kept. `/auth/status` and `createRequireCaller` check the same thing. Disabled accounts get a 403
   "account disabled" at login, after the password check, so this doesn't
   reveal which accounts exist.
 - `createAccountStore(db, { sessionCache })` adds `disable`, `enable`,
-  `revokeSessions` and `resetPassword` (login password only). With the
-  cache, the person's unlocked vaults lock right away too.
+  `revokeSessions` and `resetPassword` (login password only; it ends the
+  person's sessions too). With the cache, the person's unlocked vaults lock
+  right away too. Accepting an invite (which sets a password) also ends
+  earlier logins, and a link can only be used once even by racing requests.
 - `erase(userId, { displayName? })` is GDPR erasure for a **disabled**
   account: the `user` row stays (so the app's foreign keys and history
   resolve) with its name and email replaced, and every login identity and

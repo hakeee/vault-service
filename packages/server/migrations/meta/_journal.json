@@ -29,6 +29,13 @@
       "when": 1795219587217,
       "tag": "0003_invites",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1795347780063,
+      "tag": "0004_revoked_sessions",
+      "breakpoints": true
     }
   ]
 }

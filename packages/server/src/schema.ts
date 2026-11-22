@@ -66,7 +66,7 @@ export const userMfaFactor = sqliteTable("user_mfa_factor", {
   credentialId: text("credential_id"), // passkey only
   publicKey: blob("public_key", { mode: "buffer" }), // passkey only
   counter: integer("counter"), // passkey only
-  codes: text("codes"), // recovery only - JSON array of sha256 hex hashes of the unused codes
+  codes: text("codes"), // recovery only - JSON array of hashes of the unused codes ("h1:" + HMAC under the MFA key; older rows plain sha256)
   createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   lastUsedAt: integer("last_used_at", { mode: "timestamp_ms" }),
 });
@@ -85,4 +85,14 @@ export const userInvite = sqliteTable("user_invite", {
   expiresAt: integer("expires_at", { mode: "timestamp_ms" }).notNull(),
   acceptedAt: integer("accepted_at", { mode: "timestamp_ms" }),
   revokedAt: integer("revoked_at", { mode: "timestamp_ms" }),
+});
+
+/**
+ * Sessions ended by logging out. Session cookies are stateless, so without
+ * this a copy of the cookie would keep working after logout. Rows are kept
+ * a while longer than any session can live, then pruned.
+ */
+export const revokedSession = sqliteTable("revoked_session", {
+  sessionId: text("session_id").primaryKey(),
+  revokedAt: integer("revoked_at", { mode: "timestamp_ms" }).notNull(),
 });

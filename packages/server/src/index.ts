@@ -15,6 +15,7 @@ export * from "./auth/accountResolution.js";
 export * from "./auth/oidc.js";
 export * from "./auth/totp.js";
 export * from "./auth/mfa.js";
+export * from "./auth/device.js";
 
 export * from "./schema.js";
 export * from "./migrate.js";
@@ -27,6 +28,8 @@ export * from "./accounts.js";
 export * from "./invites.js";
 export * from "./provisioning/index.js";
 export * from "./accountStatus.js";
+export * from "./securityEvents.js";
+export { ipBucket, type AttemptLimiter } from "./attemptLimiter.js";
 
 export * from "./routes/auth.js";
 export { type MfaConfig, type MfaStage } from "./routes/mfa.js";
