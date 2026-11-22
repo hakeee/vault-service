@@ -27,6 +27,7 @@ import { user, vaultUnlockMethod } from "../schema.js";
 import { ensureSessionId, typedSession } from "../session.js";
 import { sessionCacheInternals, type SessionCache } from "../sessionCache.js";
 import type { SelfServiceAction, SelfServiceAuthorizer } from "../accountStatus.js";
+import { auditor, type AuditHandler, type AuthAuditEvent } from "../securityEvents.js";
 import { routeErrorHandler } from "./errors.js";
 
 const unlockBodySchema = z.object({ password: z.string().min(1) });
@@ -56,6 +57,8 @@ export interface VaultRoutesConfig {
   sessionCache: SessionCache;
   /** May refuse self-service actions (passkeys, recovery key, passphrase change) with a 403. Default: allowed. */
   authorize?: SelfServiceAuthorizer;
+  /** Unlocks (and failed ones), passphrase changes, unlock methods added or removed: for an audit trail. */
+  onAudit?: AuditHandler;
 }
 
 interface UnlockedVault {
@@ -74,9 +77,14 @@ interface UnlockedVault {
 export function createVaultRoutes(config: VaultRoutesConfig) {
   const { db, mode, webauthn, noneMode, sessionCache } = config;
   const { cacheSession, getSession } = sessionCacheInternals(sessionCache);
+  let logError: (error: unknown) => void = (error) => console.error("vault-service: onAudit failed", error);
+  const record = auditor(config.onAudit, (error) => logError(error));
+  const audit = (request: FastifyRequest, action: AuthAuditEvent["action"], outcome: AuthAuditEvent["outcome"], userId: number | undefined, detail?: string) =>
+    record({ action, outcome, ip: request.ip, ...(userId !== undefined ? { userId } : {}), ...(detail ? { detail } : {}) });
 
   /** Caches the session the same way for every unlock path (password, passkey, bootstrap). */
-  function startSession(request: FastifyRequest, unlocked: UnlockedVault): void {
+  function startSession(request: FastifyRequest, unlocked: UnlockedVault, how: "passphrase" | "recovery" | "passkey"): void {
+    audit(request, "vault.unlock", "ok", unlocked.userId, how);
     cacheSession(ensureSessionId(typedSession(request)), unlocked.userId, unlocked.dek);
   }
 
@@ -181,6 +189,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
   async function unlockOrBootstrapVault(
     userId: number,
     password: string,
+    request: FastifyRequest,
     reply: FastifyReply,
   ): Promise<UnlockedVault | undefined> {
     const [methodRow] = await db
@@ -210,6 +219,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       return { userId, dek };
     } catch {
       unlockFailures.fail(String(userId));
+      audit(request, "vault.unlock", "failed", userId, "passphrase");
       reply.code(401).send({ error: "wrong password" });
       return undefined;
     }
@@ -217,14 +227,18 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
 
   // Wrong passphrases and recovery keys per account: 10 in 15 minutes, then a 429.
   const unlockFailures = createAttemptLimiter({ max: 10, windowMs: 15 * 60_000 });
-  const tooManyUnlocks = (userId: number, reply: FastifyReply) => {
+  const tooManyUnlocks = (request: FastifyRequest, userId: number, reply: FastifyReply) => {
     const wait = unlockFailures.blockedFor(String(userId));
-    if (wait > 0) reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
+    if (wait > 0) {
+      audit(request, "vault.unlock", "blocked", userId);
+      reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
+    }
     return wait > 0;
   };
 
   return async function vaultRoutes(app: FastifyInstance) {
     app.setErrorHandler(routeErrorHandler);
+    logError = (error) => app.log.error({ err: error }, "vault-service: onAudit failed");
 
     app.get("/status", async (request) => {
       // `none` mode has no login to set the id, and the live socket needs
@@ -243,13 +257,13 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.post("/unlock", async (request, reply) => {
       const { password } = unlockBodySchema.parse(request.body);
       const userId = await resolveOrCreateUserIdForUnlock(request);
-      if (tooManyUnlocks(userId, reply)) return;
+      if (tooManyUnlocks(request, userId, reply)) return;
 
-      const unlocked = await unlockOrBootstrapVault(userId, password, reply);
+      const unlocked = await unlockOrBootstrapVault(userId, password, request, reply);
       if (unlocked === undefined) return; // reply already sent (wrong password / no method)
 
       unlockFailures.clear(String(userId));
-      startSession(request, unlocked);
+      startSession(request, unlocked, "passphrase");
       return { status: "unlocked" };
     });
 
@@ -265,7 +279,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
     app.post("/unlock-with-recovery", async (request, reply) => {
       const { recoveryKey } = recoveryKeyBodySchema.parse(request.body);
       const userId = await resolveOrCreateUserIdForUnlock(request);
-      if (tooManyUnlocks(userId, reply)) return;
+      if (tooManyUnlocks(request, userId, reply)) return;
 
       const [methodRow] = await db
         .select()
@@ -281,12 +295,13 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
         dek = unlockWithRecovery(decodeRecoveryKey(recoveryKey), methodRow.wrappedDek);
       } catch {
         unlockFailures.fail(String(userId));
+        audit(request, "vault.unlock", "failed", userId, "recovery");
         reply.code(401).send({ error: "wrong recovery key" });
         return;
       }
 
       unlockFailures.clear(String(userId));
-      startSession(request, { userId, dek });
+      startSession(request, { userId, dek }, "recovery");
       return { status: "unlocked" };
     });
 
@@ -365,6 +380,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
 
       typed.set("passkeyChallenge", "");
       typed.set("passkeyPrfSalt", "");
+      audit(request, "vault.method-added", "ok", session.userId, "passkey");
       return { status: "registered" };
     });
 
@@ -420,6 +436,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
           counter: storedCounter,
         });
       } catch {
+        audit(request, "vault.unlock", "failed", methodRow.userId, "passkey");
         reply.code(401).send({ error: "passkey verification failed" });
         return;
       }
@@ -432,6 +449,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       // backwards.
       const isCounterlessAuthenticator = storedCounter === 0 && verified.newCounter === 0;
       if (!isCounterlessAuthenticator && verified.newCounter <= storedCounter) {
+        audit(request, "vault.unlock", "failed", methodRow.userId, "passkey");
         reply.code(401).send({ error: "passkey counter did not increase - possible cloned authenticator" });
         return;
       }
@@ -440,6 +458,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       try {
         dek = unlockWithPasskey(Buffer.from(prfOutput, "base64url"), methodRow.wrappedDek);
       } catch {
+        audit(request, "vault.unlock", "failed", methodRow.userId, "passkey");
         reply.code(401).send({ error: "wrong passkey" });
         return;
       }
@@ -450,7 +469,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
         .where(eq(vaultUnlockMethod.id, methodRow.id));
 
       typed.set("passkeyChallenge", "");
-      startSession(request, { userId: methodRow.userId, dek });
+      startSession(request, { userId: methodRow.userId, dek }, "passkey");
       return { status: "unlocked" };
     });
 
@@ -476,6 +495,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
         createdAt: new Date(),
       });
 
+      audit(request, "vault.method-added", "ok", session.userId, "recovery key");
       return { status: "registered" };
     });
 
@@ -499,6 +519,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
         reply.code(500).send({ error: "no password unlock method found" });
         return;
       }
+      audit(request, "vault.passphrase-change", "ok", session.userId);
       return { status: "changed" };
     });
 
@@ -524,6 +545,7 @@ export function createVaultRoutes(config: VaultRoutesConfig) {
       }
 
       await db.delete(vaultUnlockMethod).where(eq(vaultUnlockMethod.id, id));
+      audit(request, "vault.method-removed", "ok", userId, methodRow.method);
       return { status: "revoked" };
     });
   };

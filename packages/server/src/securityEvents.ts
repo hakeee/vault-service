@@ -26,3 +26,50 @@ export function securityNotifier(handler: SecurityEventHandler | undefined, log:
       .catch(log);
   };
 }
+
+/**
+ * Something that happened at the door, for an audit trail (`onAudit` on the
+ * auth and vault routes): logins and their failures, second factors,
+ * password and passphrase changes, unlocks. Storing them is the app's job.
+ */
+export interface AuthAuditEvent {
+  action:
+    | "login" // a finished login (detail: local / oidc)
+    | "login.password" // the password step: failed, blocked, refused (disabled), ok (second step follows)
+    | "login.mfa" // a wrong or blocked second-factor code
+    | "logout"
+    | "reauth" // the password re-typed on a logged-in session (changing factors)
+    | "password.change"
+    | "mfa.factor-added"
+    | "mfa.factor-removed"
+    | "mfa.recovery-codes"
+    | "invite.open" // a link that didn't match an open invite
+    | "invite.accept"
+    | "oidc.refused" // detail: the refusal code
+    | "vault.unlock" // detail: passphrase / recovery / passkey
+    | "vault.passphrase-change"
+    | "vault.method-added"
+    | "vault.method-removed";
+  outcome: "ok" | "failed" | "blocked" | "refused";
+  /** The account, when known. */
+  userId?: number;
+  /** Login attempts: the email that was typed (lowercased), also for accounts that don't exist. */
+  email?: string;
+  /** The client's address (`request.ip`). */
+  ip: string;
+  detail?: string;
+}
+
+export type AuditHandler = (event: AuthAuditEvent) => void;
+
+/** Calls the app's audit handler; a throwing one is logged, never breaks the request. */
+export function auditor(handler: AuditHandler | undefined, log: (error: unknown) => void) {
+  return (event: AuthAuditEvent): void => {
+    if (!handler) return;
+    try {
+      handler(event);
+    } catch (error) {
+      log(error);
+    }
+  };
+}

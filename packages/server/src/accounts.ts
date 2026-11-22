@@ -84,6 +84,14 @@ export function createAccountStore(db: BetterSQLite3Database<any>, options: Acco
     },
 
     /** "Log out everywhere". */
+    /** Renames the account (what schedules, feeds and booking pages show). */
+    async setDisplayName(userId: number, displayName: string): Promise<{ ok: true } | { error: "not-found" }> {
+      const name = displayName.trim();
+      if (!name) throw new Error("a display name can't be empty");
+      const updated = db.update(user).set({ displayName: name }).where(eq(user.id, userId)).returning({ id: user.id }).all();
+      return updated.length > 0 ? { ok: true } : { error: "not-found" };
+    },
+
     async revokeSessions(userId: number): Promise<void> {
       endSessions(userId);
     },

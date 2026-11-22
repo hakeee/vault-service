@@ -171,6 +171,18 @@ login and the rest after unlock:
   A session that's ended (disabled, logged out) can't use it. Afterwards
   every other login of the account ends, including copies of this
   session's cookie from before, and their vaults lock.
+- `onAudit(event)` (on `createAuthRoutes` and `createVaultRoutes`) hears
+  about everything at the door, for an audit trail: finished logins,
+  password-step failures (with the typed email, also for unknown
+  accounts), blocks, refused (disabled) accounts, second-factor failures,
+  logouts, password and passphrase changes, factors and unlock methods
+  added or removed, unlocks and failed unlocks, invite misses, refused
+  OIDC logins. `{ action, outcome, userId?, email?, ip, detail? }`
+  (`AuthAuditEvent`); storing them is the app's job. A throwing handler is
+  logged and changes nothing.
+- Logins match the email in any case. Accounts made without a name are
+  named after the email's local part (`nameFromEmail`), OIDC ones after the
+  IdP's `name` claim; `accounts.setDisplayName(userId, name)` renames.
 - `onSecurityEvent(event)` hears about `password-changed`, `factor-added`,
   `factor-removed`, `recovery-codes-replaced` and `mfa-blocked` (too many
   wrong codes: someone may have the password), with `{ userId, kind,

@@ -1,11 +1,11 @@
 import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { createInviteStore } from "../invites.js";
 import { z } from "zod";
 import { createAttemptLimiter, ipBucket, MIN_SECRET_LENGTH, type AttemptLimit } from "../attemptLimiter.js";
 import { createDeviceCookies, deriveDeviceKey } from "../auth/device.js";
-import { securityNotifier, type SecurityEventHandler } from "../securityEvents.js";
+import { auditor, securityNotifier, type AuditHandler, type AuthAuditEvent, type SecurityEventHandler } from "../securityEvents.js";
 import {
   buildAuthorizationRequest,
   createOidcClient,
@@ -22,6 +22,18 @@ import type { SessionCache } from "../sessionCache.js";
 import { endOtherSessions, revokeSession, sessionStatus, type SelfServiceAuthorizer } from "../accountStatus.js";
 import { routeErrorHandler } from "./errors.js";
 import { createMfaRoutes, MFA_SESSION_KEYS, type MfaConfig } from "./mfa.js";
+
+/**
+ * A stand-in name for an account made without one: the email's local part,
+ * never the address itself (names show on schedules, feeds and booking pages).
+ */
+export const nameFromEmail = (email: string) => email.split("@")[0]!.trim() || "New user";
+/** The person's name from an IdP's claims (`name`, else given + family name), if it has one. */
+const claimedName = (claims: Record<string, unknown> | undefined) => {
+  const text = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const name = text(claims?.name) || [text(claims?.given_name), text(claims?.family_name)].filter(Boolean).join(" ");
+  return name ? name.slice(0, 80) : undefined;
+};
 
 const loginBodySchema = z.object({ email: z.email(), password: z.string().min(1) });
 const acceptInviteBodySchema = z.object({ password: z.string().min(MIN_SECRET_LENGTH, `choose a password of at least ${MIN_SECRET_LENGTH} characters`) });
@@ -98,6 +110,8 @@ export interface AuthRoutesConfig {
    * email them. Runs after the change; a failure is logged, nothing more.
    */
   onSecurityEvent?: SecurityEventHandler;
+  /** Every login, failed attempt, block and security change, for an audit trail (see `AuthAuditEvent`). */
+  onAudit?: AuditHandler;
   /**
    * Second factors for `single` mode (authenticator apps, login passkeys,
    * recovery codes), served under `/mfa`. Without it, a correct password
@@ -152,6 +166,10 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
   const reauthFailures = createAttemptLimiter({ max: 10, windowMs: 15 * 60_000, escalate: { maxBlockMs: 24 * 60 * 60_000 } });
   let logError: (error: unknown) => void = (error) => console.error("vault-service: onSecurityEvent failed", error);
   const notify = securityNotifier(config.onSecurityEvent, (error) => logError(error));
+  const record = auditor(config.onAudit, (error) => logError(error));
+  /** An audit event from this request. */
+  const audit = (request: FastifyRequest, action: AuthAuditEvent["action"], outcome: AuthAuditEvent["outcome"], extra: Partial<Omit<AuthAuditEvent, "action" | "outcome" | "ip">> = {}) =>
+    record({ action, outcome, ip: request.ip, ...extra });
   const bootstrapEmail = config.bootstrapEmail?.trim().toLowerCase() || undefined;
   /** Whether a login for an unknown account may create it. `verified`: the email is known to be the person's (OIDC). */
   const signupOpen = async (email: string | undefined, verified: boolean) => {
@@ -201,6 +219,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     unsetSessionKeys(session, MFA_SESSION_KEYS);
     startLogin(session, userId);
     if (provider === "local") devices.issue(request, reply, userId);
+    audit(request, "login", "ok", { userId, detail: provider });
     await onLogin?.({ userId, created, provider, ...(claims ? { claims } : {}) });
   }
 
@@ -213,6 +232,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
           devices,
           reauthFailures,
           notify,
+          audit,
         })
       : undefined;
 
@@ -223,6 +243,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const kinds = mfa.store.primaryKinds(userId);
       if (kinds.length > 0 || (await config.mfa!.required?.(userId))) {
         mfa.begin(session, userId, kinds.length > 0 ? "verify" : "setup", created, (id) => sessionCache?.dropSession(id));
+        audit(request, "login.password", "ok", { userId, detail: kinds.length > 0 ? "second step" : "second step setup" });
         return kinds.length > 0 ? { status: "mfa_required", factors: kinds } : { status: "mfa_setup_required" };
       }
     }
@@ -260,17 +281,20 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const accountKey = email.toLowerCase();
       const ipKey = ipBucket(request.ip);
       const pairKey = `${accountKey} ${ipKey}`;
-      const [existingUser] = await db.select().from(user).where(eq(user.email, email));
+      // Any case: people type their address however they like.
+      const [existingUser] = await db.select().from(user).where(sql`lower(${user.email}) = ${accountKey}`).limit(1);
       // A browser this account logged in from before has its own count, untouched by guessing elsewhere.
       const device = existingUser ? devices.read(request, existingUser.id) : undefined;
       const wait = device
         ? perDevice.blockedFor(device)
         : Math.max(perAccountIp.blockedFor(pairKey), perAccount.blockedFor(accountKey), perIp.blockedFor(ipKey));
       if (wait > 0) {
+        audit(request, "login.password", "blocked", { email: accountKey, userId: existingUser?.id });
         reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
         return;
       }
-      const failed = () => {
+      const failed = (why: string) => {
+        audit(request, "login.password", "failed", { email: accountKey, userId: existingUser?.id, detail: why });
         if (device) perDevice.fail(device);
         else {
           perAccountIp.fail(pairKey);
@@ -286,7 +310,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         // Same answer and timing as a wrong password, so closed signup doesn't reveal which emails exist.
         if (!(await signupOpen(email, true))) {
           await burnPasswordCheck(password);
-          return failed();
+          return failed("no such account");
         }
         if (password.length < MIN_SECRET_LENGTH) {
           reply.code(400).send({ error: `choose a password of at least ${MIN_SECRET_LENGTH} characters` });
@@ -295,7 +319,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         const passwordHash = await hashPassword(password);
         const [createdUser] = await db
           .insert(user)
-          .values({ displayName: email, email, createdAt: new Date() })
+          .values({ displayName: nameFromEmail(email), email, createdAt: new Date() })
           .returning();
         if (!createdUser) throw new Error("user insert returned no row");
 
@@ -311,14 +335,15 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
 
       if (!identity?.passwordHash) {
         await burnPasswordCheck(password);
-        return failed();
+        return failed("no password login");
       }
-      if (!(await verifyPasswordHash(identity.passwordHash, password))) return failed();
+      if (!(await verifyPasswordHash(identity.passwordHash, password))) return failed("wrong password");
       // Only this address's (or browser's) count: guessing from elsewhere keeps counting against the account.
       if (device) perDevice.clear(device);
       else perAccountIp.clear(pairKey);
 
       if (await isDisabled(existingUser.id)) {
+        audit(request, "login.password", "refused", { email: accountKey, userId: existingUser.id, detail: "account disabled" });
         reply.code(403).send({ error: "account disabled" });
         return;
       }
@@ -348,6 +373,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const { currentPassword, newPassword } = changePasswordBodySchema.parse(request.body);
       const wait = reauthFailures.blockedFor(String(userId));
       if (wait > 0) {
+        audit(request, "password.change", "blocked", { userId });
         reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
         return;
       }
@@ -357,6 +383,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         .where(and(eq(userIdentity.userId, userId), eq(userIdentity.provider, "local")));
       if (!identity?.passwordHash || !(await verifyPasswordHash(identity.passwordHash, currentPassword))) {
         reauthFailures.fail(String(userId));
+        audit(request, "password.change", "failed", { userId, detail: "wrong current password" });
         reply.code(401).send({ error: "wrong password" });
         return;
       }
@@ -365,6 +392,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       endOtherSessions(db, session, userId);
       sessionCache?.dropUser(userId, sessionId);
       notify({ userId, kind: "password-changed" });
+      audit(request, "password.change", "ok", { userId });
       return { status: "changed" };
     });
 
@@ -395,11 +423,13 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
     const openInvite = (request: FastifyRequest, reply: FastifyReply, token: string) => {
       const wait = inviteMisses.blockedFor(ipBucket(request.ip));
       if (wait > 0) {
+        audit(request, "invite.open", "blocked");
         reply.code(429).header("retry-after", wait).send({ error: "too many attempts; try again later" });
         return undefined;
       }
       const invite = invites.find(token);
       if (!invite) {
+        audit(request, "invite.open", "failed");
         inviteMisses.fail(ipBucket(request.ip));
         reply.code(404).send({ error: "this invite link has expired or was already used - ask for a new one" });
         return undefined;
@@ -436,6 +466,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       // A new password (a re-invite works as a reset): any login from before ends.
       db.update(user).set({ sessionsValidAfter: new Date() }).where(eq(user.id, invite.userId)).run();
       sessionCache?.dropUser(invite.userId);
+      audit(request, "invite.accept", "ok", { userId: invite.userId });
       return passwordAccepted(request, reply, invite.userId, false);
     });
 
@@ -455,6 +486,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
      * messages: anyone can craft that URL, so it must not carry text.
      */
     const refuseOidc = (request: FastifyRequest, reply: FastifyReply, status: number, code: OidcLoginError, error: string) => {
+      audit(request, "oidc.refused", "refused", { detail: code });
       if (request.headers.accept?.includes("text/html")) {
         const url = new URL(postLoginRedirectUrl);
         url.searchParams.set("login_error", code);
@@ -565,7 +597,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
         const email = claims.email ?? `${claims.subject}@${claims.issuer}`;
         const [createdUser] = await db
           .insert(user)
-          .values({ displayName: claims.email ?? "New user", email, createdAt: new Date() })
+          .values({ displayName: claimedName(claims.raw) ?? (claims.email ? nameFromEmail(claims.email) : "New user"), email, createdAt: new Date() })
           .returning();
         if (!createdUser) throw new Error("user insert returned no row");
 
@@ -581,7 +613,7 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       if (await isDisabled(authUserId)) {
         return refuseOidc(request, reply, 403, "disabled", "account disabled");
       }
-      if (invite && invite.userId === authUserId) invites.accept(invite.id);
+      if (invite && invite.userId === authUserId && invites.accept(invite.id)) audit(request, "invite.accept", "ok", { userId: authUserId });
       await completeLogin(request, reply, authUserId, resolution.action === "create", "oidc", claims.raw);
       session.set("oidcState", "");
       session.set("oidcNonce", "");
@@ -598,7 +630,11 @@ export function createAuthRoutes(config: AuthRoutesConfig) {
       const sessionId = session.get("id");
       if (sessionId !== undefined) sessionCache?.dropSession(sessionId);
       // Stateless cookies: without this, a copy of this one would still be logged in.
-      if (sessionId && session.get("authUserId") !== undefined) revokeSession(db, sessionId);
+      const loggedOut = session.get("authUserId");
+      if (sessionId && loggedOut !== undefined) {
+        revokeSession(db, sessionId);
+        audit(request, "logout", "ok", { userId: Number(loggedOut) });
+      }
       session.delete();
       return { status: "logged_out" };
     });

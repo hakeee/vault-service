@@ -12,7 +12,7 @@ import { verifyPasswordHash } from "../auth/password.js";
 import { generateTotpSecret, totpUri, verifyTotp, base32Decode } from "../auth/totp.js";
 import { verifyPasskeyAuthentication, verifyPasskeyRegistration, type WebauthnConfig } from "../crypto/webauthn.js";
 import { user, userIdentity } from "../schema.js";
-import type { SecurityEvent } from "../securityEvents.js";
+import type { AuthAuditEvent, SecurityEvent } from "../securityEvents.js";
 import { typedSession, unsetSessionKeys, type TypedSession } from "../session.js";
 
 export interface MfaConfig {
@@ -67,6 +67,7 @@ export interface MfaRoutesDeps {
   /** Wrong passwords on a logged-in session, per account: shared with changing the password, so a stolen cookie can't guess it. */
   reauthFailures: AttemptLimiter;
   notify: (event: SecurityEvent) => void;
+  audit: (request: FastifyRequest, action: AuthAuditEvent["action"], outcome: AuthAuditEvent["outcome"], extra?: { userId?: number; detail?: string }) => void;
 }
 
 /**
@@ -77,7 +78,7 @@ export interface MfaRoutesDeps {
  * then `completeLogin` makes it a real login.
  */
 export function createMfaRoutes(deps: MfaRoutesDeps) {
-  const { db, config, devices, reauthFailures, notify } = deps;
+  const { db, config, devices, reauthFailures, notify, audit } = deps;
   const store: MfaStore = createMfaStore(db, config.key);
   // Escalating: 10 tries per 15 minutes would still add up to a fair chance at a 6-digit code over months.
   const failures = createAttemptLimiter({ max: config.maxFailures ?? 10, windowMs: 15 * 60_000, escalate: { maxBlockMs: 24 * 60 * 60_000 } });
@@ -127,9 +128,15 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
     if (wait > 0) reply.code(429).header("retry-after", wait).send({ error: "too many failed attempts; try again later" });
     return wait > 0;
   };
-  const codeBlocked = (request: FastifyRequest, who: Caller, reply: FastifyReply) => tooMany(failures, codeKey(request, who.userId), reply);
+  const codeBlocked = (request: FastifyRequest, who: Caller, reply: FastifyReply) => {
+    const blocked = tooMany(failures, codeKey(request, who.userId), reply);
+    if (blocked) audit(request, "login.mfa", "blocked", { userId: who.userId });
+    return blocked;
+  };
   const codeFailed = (request: FastifyRequest, who: Caller, reply: FastifyReply, error: string) => {
-    if (failures.fail(codeKey(request, who.userId))) notify({ userId: who.userId, kind: "mfa-blocked" });
+    const blocked = failures.fail(codeKey(request, who.userId));
+    audit(request, "login.mfa", "failed", { userId: who.userId, detail: blocked ? `${error}; now blocked` : error });
+    if (blocked) notify({ userId: who.userId, kind: "mfa-blocked" });
     reply.code(401).send({ error });
   };
   const loggedIn = async (request: FastifyRequest, reply: FastifyReply, who: Caller) => {
@@ -138,9 +145,12 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
   };
 
   /** Fully logged-in sessions re-type the password before changing factors; mid-login ones just did. */
-  async function passwordOk(who: Caller, given: string | undefined, reply: FastifyReply): Promise<boolean> {
+  async function passwordOk(request: FastifyRequest, who: Caller, given: string | undefined, reply: FastifyReply): Promise<boolean> {
     if (who.stage !== "full") return true;
-    if (tooMany(reauthFailures, String(who.userId), reply)) return false;
+    if (tooMany(reauthFailures, String(who.userId), reply)) {
+      audit(request, "reauth", "blocked", { userId: who.userId });
+      return false;
+    }
     const identity = db
       .select({ hash: userIdentity.passwordHash })
       .from(userIdentity)
@@ -148,6 +158,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
       .get();
     if (!identity?.hash || !given || !(await verifyPasswordHash(identity.hash, given))) {
       reauthFailures.fail(String(who.userId));
+      audit(request, "reauth", "failed", { userId: who.userId });
       reply.code(401).send({ error: "wrong password" });
       return false;
     }
@@ -164,6 +175,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
     unsetSessionKeys(session, ["mfaTotpSecret", "mfaChallenge"]);
     if (who.stage === "setup") await deps.completeLogin(request, reply, who.userId, who.created);
     notify({ userId: who.userId, kind: "factor-added", factor });
+    audit(request, "mfa.factor-added", "ok", { userId: who.userId, detail: factor });
     return { status: who.stage === "setup" ? "logged_in" : "added", ...(recoveryCodes ? { recoveryCodes } : {}) };
   }
 
@@ -258,7 +270,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
       const who = caller(request, reply, ["setup", "full"]);
       if (!who || codeBlocked(request, who, reply)) return;
       const body = totpConfirmBody.parse(request.body);
-      if (!(await passwordOk(who, body.password, reply))) return;
+      if (!(await passwordOk(request, who, body.password, reply))) return;
       const secret = typedSession(request).get("mfaTotpSecret");
       if (!secret) return reply.code(409).send({ error: "start the setup first" });
       const step = verifyTotp(base32Decode(secret), body.code, Date.now());
@@ -287,7 +299,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
       const who = caller(request, reply, ["setup", "full"]);
       if (!who) return;
       const body = passkeyRegisterBody.parse(request.body);
-      if (!(await passwordOk(who, body.password, reply))) return;
+      if (!(await passwordOk(request, who, body.password, reply))) return;
       const challenge = typedSession(request).get("mfaChallenge");
       if (!challenge) return reply.code(409).send({ error: "start the setup first" });
       let credential: Awaited<ReturnType<typeof verifyPasskeyRegistration>>;
@@ -304,10 +316,11 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
       const who = caller(request, reply, ["full"]);
       if (!who) return;
       const body = passwordBody.parse(request.body);
-      if (!(await passwordOk(who, body.password, reply))) return;
+      if (!(await passwordOk(request, who, body.password, reply))) return;
       if (store.primaryKinds(who.userId).length === 0) return reply.code(409).send({ error: "set up an authenticator app or passkey first" });
       const recoveryCodes = store.newRecoveryCodes(who.userId);
       notify({ userId: who.userId, kind: "recovery-codes-replaced" });
+      audit(request, "mfa.recovery-codes", "ok", { userId: who.userId });
       return { recoveryCodes };
     });
 
@@ -315,7 +328,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
       const who = caller(request, reply, ["full"]);
       if (!who) return;
       const body = removeBody.parse(request.body);
-      if (!(await passwordOk(who, body.password, reply))) return;
+      if (!(await passwordOk(request, who, body.password, reply))) return;
       const factor = store.list(who.userId).find((f) => f.id === body.id);
       if (!factor) return reply.code(404).send({ error: "no such factor" });
       if (factor.kind === "recovery") return reply.code(400).send({ error: "recovery codes are replaced, not removed" });
@@ -323,6 +336,7 @@ export function createMfaRoutes(deps: MfaRoutesDeps) {
       if (others.length === 0 && (await isRequired(who.userId))) return reply.code(409).send({ error: "two-step login is required: add another factor first" });
       store.remove(who.userId, factor.id);
       notify({ userId: who.userId, kind: "factor-removed", factor: factor.kind });
+      audit(request, "mfa.factor-removed", "ok", { userId: who.userId, detail: factor.kind });
       return { status: "removed" };
     });
   }

@@ -1479,6 +1479,55 @@ describe("hardening from the 2026-11 audit", () => {
     expect(await use(recoveryCodes[0])).toBe(200);
   });
 
+  it("reports logins, failures, blocks, second factors and vault events for an audit trail", async () => {
+    const events: { action: string; outcome: string; userId?: number; email?: string; ip: string; detail?: string }[] = [];
+    const onAudit = (e: (typeof events)[number]) => void events.push(e);
+    const { app } = buildTestApp("single", { onAudit, signup: "closed", loginLimits: { perAccountIp: 2 }, mfa: { key: randomBytes(32), issuer: "Test App", webauthn, required: () => true } }, { onAudit });
+    await app.ready();
+    const b = browser(app, "10.1.1.1");
+    await b("POST", "/auth/login", { email: "Me@example.com", password: "password1" });
+    const { secret } = (await b("POST", "/auth/mfa/totp/setup")).json();
+    await b("POST", "/auth/mfa/totp/confirm", { code: codeFor(secret) });
+    await b("POST", "/vault/unlock", { password: "passphrase" });
+    await b("POST", "/vault/lock");
+    await b("POST", "/vault/unlock", { password: "wrong-guess" });
+    await b("POST", "/auth/logout");
+    const stranger = browser(app, "10.6.6.6");
+    await stranger("POST", "/auth/login", { email: "me@example.com", password: "x1" });
+    await stranger("POST", "/auth/login", { email: "nobody@example.com", password: "x2" });
+    await stranger("POST", "/auth/login", { email: "me@example.com", password: "x3" });
+    await stranger("POST", "/auth/login", { email: "me@example.com", password: "password1" });
+    await stranger("POST", "/auth/mfa/verify/totp", { code: "000000" });
+
+    expect(events.map((e) => [e.action, e.outcome, e.userId ?? null, e.detail ?? null])).toEqual([
+      ["login.password", "ok", 1, "second step setup"],
+      ["login", "ok", 1, "local"],
+      ["mfa.factor-added", "ok", 1, "totp"],
+      ["vault.unlock", "ok", 1, "passphrase"],
+      ["vault.unlock", "failed", 1, "passphrase"],
+      ["logout", "ok", 1, null],
+      ["login.password", "failed", 1, "wrong password"],
+      ["login.password", "failed", null, "no such account"],
+      ["login.password", "failed", 1, "wrong password"],
+      ["login.password", "blocked", 1, null],
+    ]);
+    expect(events[6]).toMatchObject({ email: "me@example.com", ip: "10.6.6.6" });
+    expect(events[7]!.email).toBe("nobody@example.com");
+    // The stranger never got past the password, so there was no second step to fail.
+    expect(events.some((e) => e.action === "login.mfa")).toBe(false);
+  });
+
+  it("names a new account after the email's local part, never the address; accounts can be renamed", async () => {
+    const { app, db } = buildTestApp("single");
+    await app.ready();
+    await app.inject({ method: "POST", url: "/auth/login", payload: { email: "jan.novak@example.com", password: "password1" } });
+    const accounts = createAccountStore(db);
+    expect((await accounts.list())[0]!.displayName).toBe("jan.novak");
+    expect(await accounts.setDisplayName(1, "  Jan Novák ")).toEqual({ ok: true });
+    expect((await accounts.list())[0]!.displayName).toBe("Jan Novák");
+    expect(await accounts.setDisplayName(99, "X")).toEqual({ error: "not-found" });
+  });
+
   it("an invite link sets a password once even when two requests race, and ends earlier logins", async () => {
     const { app, db, sessionCache } = buildTestApp("single", { signup: "closed" });
     await app.ready();
