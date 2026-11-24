@@ -1,7 +1,6 @@
 {
   "name": "@hakeee/vault-service-react",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
   "type": "module",
   "exports": {
     ".": {
@@ -31,5 +30,26 @@
     "react": "^19.2.8",
     "typescript": "^6.0.2",
     "vitest": "^5.0.4"
-  }
+  },
+  "publishConfig": {
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "types": "./dist/index.d.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hakeee/vault-service.git",
+    "directory": "packages/react"
+  },
+  "files": [
+    "dist",
+    "src",
+    "!src/**/*.test.ts",
+    "!src/**/*.test.tsx"
+  ],
+  "license": "MIT"
 }

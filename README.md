@@ -5,7 +5,7 @@ passkey / recovery-key unlock over a single Data Encryption Key, `none` /
 `single` / `oidc` auth modes, and a headless React frontend with no
 styling opinions.
 
-Extracted from [Ebba](https://github.com/), a personal journaling app -
+Extracted from Ebba, a personal journaling app -
 every crypto decision here was made for that app's actual threat model
 (self-hosted, single-user-first, AES-256-GCM everywhere, Argon2id for
 passwords), not as a generic "crypto library." Read the source comments
@@ -26,6 +26,19 @@ before changing a default.
 v0.1 (server package) and v0.2 (headless React package) are done. The
 server package also owns its tables' migrations, and since 0.2.0 hands
 out per-feature encryption scopes instead of the raw key. See `ROADMAP.md`.
+
+## Installing
+
+Not on npm. Each `v*` tag builds release tarballs on GitHub; depend on the release URL:
+
+```json
+"@hakeee/vault-service": "https://github.com/hakeee/vault-service/releases/download/v0.2.0/hakeee-vault-service-0.2.0.tgz",
+"@hakeee/vault-service-react": "https://github.com/hakeee/vault-service/releases/download/v0.2.0/hakeee-vault-service-react-0.2.0.tgz"
+```
+
+Apps that work on this repo alongside install it from a sibling checkout instead (`link:`). The
+release tarballs hold only the build: their `exports` point at `dist/`, while a linked checkout
+resolves the `development` condition to `src/`.
 
 ## Using it
 
@@ -354,3 +367,7 @@ SQLite database and owns everything else in it.
 4. Migrations run inside one transaction per `migrateVaultService` call.
    Don't put `PRAGMA` statements in them; they're no-ops inside a
    transaction.
+
+## License
+
+MIT, see [LICENSE](./LICENSE).

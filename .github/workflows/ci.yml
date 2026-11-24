@@ -1,0 +1,54 @@
+# Typecheck, test and build on every push. A v* tag also packs the package(s) and attaches the
+# tarballs to a GitHub release: that release URL is what apps put in their package.json.
+name: ci
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # the release, on tags only
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: vault-service
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: vault-service/package.json
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install
+        working-directory: vault-service
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        working-directory: vault-service
+        run: pnpm run typecheck
+      - name: Test
+        working-directory: vault-service
+        run: pnpm test
+      - name: Build
+        working-directory: vault-service
+        run: pnpm run build
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: vault-service
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          for dir in packages/server packages/react; do
+            version=$(jq -r .version "$dir/package.json")
+            if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::$dir/package.json says $version, the tag says $GITHUB_REF_NAME"; exit 1
+            fi
+            (cd "$dir" && pnpm pack --pack-destination "$RUNNER_TEMP/out")
+          done
+          # A release is never replaced: apps' lockfiles hold each tarball's integrity hash.
+          gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP"/out/*.tgz --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
